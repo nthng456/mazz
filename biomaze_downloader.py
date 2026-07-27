@@ -1,305 +1,310 @@
 """
 Biomaze Video Downloader
-Downloads 720p videos from stream.biomaze.ir using Playwright + ffmpeg
+Downloads videos from stream.biomaze.ir using Playwright + ffmpeg
+Uploads to Hugging Face Bucket, then deletes local file to save disk
 """
 
 from playwright.sync_api import sync_playwright
 import subprocess
+import logging
+import json
 import sys
 import os
 import re
 import tempfile
+import time
+
+REFERER = "https://stream.biomaze.ir"
+QUALITIES = ["1080", "720", "480"]
+HF_BUCKET = "hf://buckets/StellarWeight/Bucket"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("downloader.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("biomaze")
 
 
-def extract_m3u8(video_url: str, quality: str = "720p", referer: str = "https://stream.biomaze.ir") -> dict:
-    """
-    Extract m3u8 URLs from a biomaze iframe page.
-    Returns dict with master_m3u8 content, chosen quality m3u8 content, and metadata.
-    """
-
-    # Ensure URL ends with /iframe
+def extract_all_m3u8(video_url: str) -> dict | None:
     if not video_url.endswith("/iframe"):
         video_url = video_url.rstrip("/") + "/iframe"
 
-    decrypted_m3u8 = []
+    log.info(f"Extracting m3u8 from: {video_url}")
+    t0 = time.time()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            extra_http_headers={"Referer": referer}
-        )
-        page = context.new_page()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(extra_http_headers={"Referer": REFERER})
+            page = context.new_page()
 
-        # Hook TextDecoder to capture decrypted m3u8 content
-        page.add_init_script("""
-            window.__decryptedM3u8 = [];
-            const origDecode = TextDecoder.prototype.decode;
-            TextDecoder.prototype.decode = function(...args) {
-                const result = origDecode.apply(this, args);
-                if (result && typeof result === 'string' && result.includes('#EXTM3U')) {
-                    window.__decryptedM3u8.push(result);
-                }
-                return result;
-            };
-        """)
+            page.add_init_script("""
+                window.__decryptedM3u8 = [];
+                const origDecode = TextDecoder.prototype.decode;
+                TextDecoder.prototype.decode = function(...args) {
+                    const result = origDecode.apply(this, args);
+                    if (result && typeof result === 'string' && result.includes('#EXTM3U')) {
+                        window.__decryptedM3u8.push(result);
+                    }
+                    return result;
+                };
+            """)
 
-        print(f"[*] Loading page: {video_url}")
-        page.goto(video_url, wait_until="networkidle")
-        page.wait_for_timeout(2000)
+            page.goto(video_url, wait_until="networkidle")
+            page.wait_for_timeout(2000)
 
-        # Click play to trigger HLS loading
-        for selector in ["video", "[class*='play']", ".media"]:
-            try:
-                page.click(selector, timeout=3000)
-                break
-            except:
-                continue
+            for selector in ["video", "[class*='play']", ".media"]:
+                try:
+                    page.click(selector, timeout=3000)
+                    break
+                except:
+                    continue
 
-        # Wait for HLS to load and decrypt m3u8
-        page.wait_for_timeout(8000)
+            page.wait_for_timeout(6000)
 
-        decrypted_m3u8 = page.evaluate("() => window.__decryptedM3u8")
+            m3u8_list = page.evaluate("() => window.__decryptedM3u8")
+            if not m3u8_list:
+                log.warning(f"No m3u8 captured for {video_url}")
+                browser.close()
+                return None
 
-        # Get video title from page
-        title = page.title() or "video"
-        title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()
+            master = m3u8_list[0]
+            log.debug(f"Master playlist:\n{master[:300]}")
 
-        browser.close()
+            qualities = {}
+            lines = master.strip().split("\n")
+            for i, line in enumerate(lines):
+                if "#EXT-X-STREAM-INF" in line:
+                    name_match = re.search(r'NAME="(\d+)p"', line)
+                    if name_match and i + 1 < len(lines):
+                        q = name_match.group(1)
+                        qualities[q] = lines[i + 1].strip()
 
-    if not decrypted_m3u8:
-        print("[!] No m3u8 data found. The page might require interaction.")
+            log.info(f"Master has qualities: {list(qualities.keys())}")
+
+            default_m3u8 = m3u8_list[1] if len(m3u8_list) > 1 else None
+            result = {"master": master, "qualities": qualities, "playlists": {}}
+
+            for q in QUALITIES:
+                if q not in qualities:
+                    continue
+
+                page.evaluate("() => { window.__decryptedM3u8 = []; }")
+
+                page.evaluate(f"""() => {{
+                    for (const k of Object.keys(window)) {{
+                        try {{
+                            const obj = window[k];
+                            if (obj && obj.levels && obj.loadLevel !== undefined) {{
+                                for (let i = 0; i < obj.levels.length; i++) {{
+                                    if (obj.levels[i].height === {q}) {{
+                                        obj.currentLevel = i;
+                                        obj.loadLevel = i;
+                                        break;
+                                    }}
+                                }}
+                            }}
+                        }} catch(e) {{}}
+                    }}
+                }}""")
+
+                page.wait_for_timeout(4000)
+
+                new_m3u8 = page.evaluate("() => window.__decryptedM3u8")
+                for m in new_m3u8:
+                    if "#EXT-X-KEY" in m and "#EXT-X-STREAM-INF" not in m:
+                        result["playlists"][q] = m
+                        log.info(f"  Captured {q}p playlist ({len(m)} bytes)")
+                        break
+
+            if default_m3u8 and "#EXT-X-KEY" in default_m3u8:
+                for q in QUALITIES:
+                    if q not in result["playlists"] and q in qualities:
+                        result["playlists"][q] = default_m3u8
+                        log.info(f"  Using default playlist for {q}p")
+
+            browser.close()
+            elapsed = time.time() - t0
+            log.info(f"Extraction done in {elapsed:.1f}s — got {list(result['playlists'].keys())}")
+            return result
+
+    except Exception as e:
+        log.error(f"Extraction failed for {video_url}: {e}", exc_info=True)
         return None
 
-    # First m3u8 is the master playlist
-    master = decrypted_m3u8[0]
-    print(f"\n[*] Master playlist found with qualities:")
 
-    # Parse qualities from master playlist
-    qualities = {}
-    lines = master.strip().split("\n")
-    for i, line in enumerate(lines):
-        if "#EXT-X-STREAM-INF" in line:
-            name_match = re.search(r'NAME="(\d+p)"', line)
-            res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-            if name_match and i + 1 < len(lines):
-                q_name = name_match.group(1)
-                q_url = lines[i + 1].strip()
-                q_res = res_match.group(1) if res_match else "?"
-                qualities[q_name] = q_url
-                marker = " <--" if q_name == quality else ""
-                print(f"    {q_name} ({q_res}){marker}")
-
-    if quality not in qualities:
-        print(f"[!] Quality '{quality}' not found. Available: {list(qualities.keys())}")
-        return None
-
-    # Find the corresponding quality m3u8 from decrypted data
-    chosen_url = qualities[quality]
-    chosen_m3u8_content = None
-
-    # The quality m3u8 is the one that was loaded by HLS.js
-    # Since HLS auto-selects, we need to find the right one
-    # We have the master (index 0) and typically 1080p playlist loaded by default
-    # We need to match by checking if the URL was loaded
-    # For now, return the chosen URL - ffmpeg can handle encrypted m3u8 if we pass headers
-
-    return {
-        "title": title,
-        "master_m3u8": master,
-        "quality": quality,
-        "quality_url": chosen_url,
-        "all_qualities": qualities,
-        "all_m3u8": decrypted_m3u8,
-    }
-
-
-def download_with_ffmpeg(m3u8_content: str, output_path: str, referer: str = "https://stream.biomaze.ir"):
-    """
-    Download video using ffmpeg from m3u8 content.
-    """
-    # Write m3u8 to a temp file
+def download_with_ffmpeg(m3u8_content: str, output_path: str) -> bool:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".m3u8", delete=False, encoding="utf-8") as f:
         f.write(m3u8_content)
         m3u8_path = f.name
 
-    print(f"\n[*] Downloading to: {output_path}")
-    print(f"[*] Using temp m3u8: {m3u8_path}")
+    log.info(f"  ffmpeg → {output_path}")
+    t0 = time.time()
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-headers", f"Referer: {referer}\r\nOrigin: {referer}\r\n",
+        "ffmpeg", "-y",
+        "-headers", f"Referer: {REFERER}\r\nOrigin: {REFERER}\r\n",
         "-i", m3u8_path,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         output_path,
     ]
 
-    print(f"[*] Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=False)
-
-    # Cleanup
+    result = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(m3u8_path)
+    elapsed = time.time() - t0
 
     if result.returncode == 0:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"\n[+] Download complete! Size: {size_mb:.1f} MB")
-        print(f"[+] Saved to: {output_path}")
+        log.info(f"  ffmpeg done: {size_mb:.1f} MB in {elapsed:.1f}s")
+        return True
     else:
-        print(f"\n[!] ffmpeg exited with code {result.returncode}")
-
-    return result.returncode == 0
-
-
-def extract_720p_m3u8_content(video_url: str, referer: str = "https://stream.biomaze.ir") -> tuple:
-    """
-    Extract the 720p m3u8 content by forcing HLS.js to load that quality.
-    Returns (title, m3u8_content) or (None, None) on failure.
-    """
-    if not video_url.endswith("/iframe"):
-        video_url = video_url.rstrip("/") + "/iframe"
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            extra_http_headers={"Referer": referer}
-        )
-        page = context.new_page()
-
-        # Hook TextDecoder to capture ALL decrypted m3u8 content
-        page.add_init_script("""
-            window.__decryptedM3u8 = [];
-            const origDecode = TextDecoder.prototype.decode;
-            TextDecoder.prototype.decode = function(...args) {
-                const result = origDecode.apply(this, args);
-                if (result && typeof result === 'string' && result.includes('#EXTM3U')) {
-                    window.__decryptedM3u8.push(result);
-                }
-                return result;
-            };
-        """)
-
-        print(f"[*] Loading page: {video_url}")
-        page.goto(video_url, wait_until="networkidle")
-        page.wait_for_timeout(2000)
-
-        # Click play
-        for selector in ["video", "[class*='play']", ".media"]:
-            try:
-                page.click(selector, timeout=3000)
-                break
-            except:
-                continue
-
-        page.wait_for_timeout(6000)
-
-        # Get master playlist first
-        m3u8_list = page.evaluate("() => window.__decryptedM3u8")
-        if not m3u8_list:
-            print("[!] No m3u8 found")
-            browser.close()
-            return None, None
-
-        master = m3u8_list[0]
-
-        # Parse 720p URL from master
-        target_url = None
-        lines = master.strip().split("\n")
-        for i, line in enumerate(lines):
-            if '#EXT-X-STREAM-INF' in line and '720' in line:
-                if i + 1 < len(lines):
-                    target_url = lines[i + 1].strip()
-                    break
-
-        if not target_url:
-            print("[!] 720p quality not found in master playlist")
-            browser.close()
-            return None, None
-
-        print(f"[*] 720p URL: {target_url}")
-
-        # Now force HLS.js to switch to 720p level
-        page.evaluate("""(targetUrl) => {
-            // Clear previous captures
-            window.__decryptedM3u8 = [];
-
-            // Find HLS instance and force level
-            for (const k of Object.keys(window)) {
-                try {
-                    const obj = window[k];
-                    if (obj && obj.levels && obj.loadLevel !== undefined) {
-                        // Find the 720p level index
-                        for (let i = 0; i < obj.levels.length; i++) {
-                            if (obj.levels[i].height === 720) {
-                                obj.currentLevel = i;
-                                obj.loadLevel = i;
-                                break;
-                            }
-                        }
-                    }
-                } catch(e) {}
-            }
-        }""", target_url)
-
-        page.wait_for_timeout(5000)
-
-        # Check if 720p m3u8 was captured
-        new_m3u8 = page.evaluate("() => window.__decryptedM3u8")
-
-        title = page.title() or "video"
-        title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()
-
-        browser.close()
-
-        # Find the 720p quality m3u8 (not the master, should have #EXT-X-KEY)
-        all_m3u8 = m3u8_list + new_m3u8
-        quality_m3u8 = None
-        for m in all_m3u8:
-            if "#EXT-X-KEY" in m and "#EXT-X-STREAM-INF" not in m:
-                # This is a quality-specific playlist
-                quality_m3u8 = m
-                # Prefer the one loaded after we switched to 720p
-                if m in new_m3u8:
-                    quality_m3u8 = m
-                    break
-
-        if quality_m3u8:
-            print(f"[+] Got 720p m3u8 content ({len(quality_m3u8)} bytes)")
-            return title, quality_m3u8
-        else:
-            print("[!] Could not capture 720p m3u8 content")
-            return title, None
-
-
-def download_video(video_url: str, output_dir: str = ".", quality: str = "720p"):
-    """
-    Main function: download a video from biomaze in specified quality.
-    """
-    referer = "https://stream.biomaze.ir"
-
-    title, m3u8_content = extract_720p_m3u8_content(video_url, referer)
-
-    if not m3u8_content:
-        print("[!] Failed to extract m3u8 content")
+        stderr_tail = result.stderr[-500:] if result.stderr else "no stderr"
+        log.error(f"  ffmpeg FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
         return False
 
-    # Sanitize title for filename
-    safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()
-    if not safe_title:
-        safe_title = "video"
 
-    output_path = os.path.join(output_dir, f"{safe_title}_{quality}.mp4")
+def upload_file_to_hf(local_path: str, hf_dest: str) -> bool:
+    cmd = ["hf", "upload", local_path, hf_dest]
+    log.info(f"  Uploading: {os.path.basename(local_path)} → {hf_dest}")
+    t0 = time.time()
 
-    return download_with_ffmpeg(m3u8_content, output_path, referer)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = time.time() - t0
+
+    if result.returncode == 0:
+        log.info(f"  Upload OK in {elapsed:.1f}s")
+        return True
+    else:
+        stderr_tail = result.stderr[-300:] if result.stderr else "no stderr"
+        log.error(f"  Upload FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
+        return False
+
+
+def sync_folder_to_hf(local_dir: str) -> bool:
+    cmd = ["hf", "sync", local_dir, HF_BUCKET]
+    log.info(f"Syncing folder: {local_dir} → {HF_BUCKET}")
+    t0 = time.time()
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = time.time() - t0
+
+    if result.returncode == 0:
+        log.info(f"Sync OK in {elapsed:.1f}s")
+        return True
+    else:
+        stderr_tail = result.stderr[-300:] if result.stderr else "no stderr"
+        log.error(f"Sync FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
+        return False
+
+
+def process_json(json_path: str, output_base: str = "./data"):
+    log.info(f"{'='*60}")
+    log.info(f"Processing: {json_path}")
+    log.info(f"Output base: {output_base}")
+    log.info(f"HF Bucket: {HF_BUCKET}")
+    log.info(f"{'='*60}")
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    folder_name = data["folder_name"]
+    files = data["files"]
+
+    folder_path = os.path.join(output_base, folder_name)
+
+    for q in QUALITIES:
+        qpath = os.path.join(folder_path, q)
+        os.makedirs(qpath, exist_ok=True)
+        log.info(f"Directory ready: {qpath}")
+
+    total_links = sum(len(f["links"]) for f in files)
+    log.info(f"Total items: {len(files)} sessions, {total_links} video parts")
+
+    done = 0
+    success = 0
+    failed = 0
+
+    for item in files:
+        order = item["order"]
+        links = item["links"]
+
+        for part_idx, link in enumerate(links, start=1):
+            done += 1
+
+            if len(links) == 1:
+                filename = f"{order}.mp4"
+            else:
+                filename = f"{order}-{part_idx}.mp4"
+
+            log.info(f"")
+            log.info(f"[{done}/{total_links}] ▶ {filename}")
+            log.info(f"  URL: {link}")
+
+            # Step 1: Extract m3u8 for all qualities
+            m3u8_data = extract_all_m3u8(link)
+            if not m3u8_data:
+                log.error(f"  SKIP — m3u8 extraction failed")
+                failed += 1
+                continue
+
+            available = list(m3u8_data["playlists"].keys())
+            log.info(f"  Extracted playlists: {available}")
+
+            all_ok = True
+
+            for q in QUALITIES:
+                if q not in m3u8_data["playlists"]:
+                    log.warning(f"  [{q}p] Not available")
+                    continue
+
+                out_path = os.path.join(folder_path, q, filename)
+
+                # Step 2: Download with ffmpeg
+                log.info(f"  [{q}p] Downloading...")
+                dl_ok = download_with_ffmpeg(m3u8_data["playlists"][q], out_path)
+                if not dl_ok:
+                    all_ok = False
+                    log.error(f"  [{q}p] Download failed!")
+                    continue
+
+                # Step 3: Upload to HF bucket
+                hf_dest = f"{HF_BUCKET}/{folder_name}/{q}/{filename}"
+                up_ok = upload_file_to_hf(out_path, hf_dest)
+
+                if up_ok:
+                    # Step 4: Delete local file after successful upload
+                    os.remove(out_path)
+                    log.info(f"  [{q}p] Local file deleted: {out_path}")
+                else:
+                    all_ok = False
+                    log.error(f"  [{q}p] Upload failed — keeping local file: {out_path}")
+
+            if all_ok:
+                success += 1
+            else:
+                failed += 1
+
+            log.info(f"  Progress: {done}/{total_links} done | {success} ok | {failed} failed")
+
+    log.info(f"")
+    log.info(f"{'='*60}")
+    log.info(f"FINISHED: {json_path}")
+    log.info(f"  Total: {total_links} | Success: {success} | Failed: {failed}")
+    log.info(f"{'='*60}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python biomaze_downloader.py <video_url> [output_dir]")
-        print("Example: python biomaze_downloader.py https://stream.biomaze.ir/evgaf5jqtgot/iframe")
+        print("Usage: python biomaze_downloader.py <json_path> [output_dir]")
+        print("Example: python biomaze_downloader.py physics.json ./data")
         sys.exit(1)
 
-    video_url = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else "."
-
-    download_video(video_url, output_dir, quality="720p")
+    json_path = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "./data"
+    process_json(json_path, output_dir)
