@@ -16,7 +16,7 @@ import time
 
 REFERER = "https://stream.biomaze.ir"
 QUALITIES = ["1080", "720", "480"]
-HF_BUCKET = "hf://buckets/StellarWeight/Bucket"
+HF_BUCKET = "hf://buckets/nthng454/Bucket"
 
 logging.basicConfig(
     level=logging.INFO,
