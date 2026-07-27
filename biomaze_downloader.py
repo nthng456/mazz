@@ -5,14 +5,17 @@ Uploads to Hugging Face Bucket, then deletes local file to save disk
 """
 
 from playwright.sync_api import sync_playwright
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import subprocess
+import threading
 import logging
 import json
 import sys
 import os
 import re
-import tempfile
+
 import time
+import urllib.request
 
 REFERER = "https://stream.biomaze.ir"
 QUALITIES = ["1080", "720", "480"]
@@ -180,27 +183,77 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
         return None
 
 
-def download_with_ffmpeg(m3u8_content: str, output_path: str) -> bool:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".m3u8", delete=False, encoding="utf-8") as f:
-        f.write(m3u8_content)
-        m3u8_path = f.name
+class M3U8ProxyHandler(BaseHTTPRequestHandler):
+    """Local proxy that serves m3u8 content and proxies segment/key requests with Referer."""
+    m3u8_content = ""
 
-    log.info(f"  ffmpeg → {output_path}")
+    def do_GET(self):
+        if self.path == "/playlist.m3u8":
+            data = self.server.m3u8_content.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith("/proxy?url="):
+            target_url = self.path[len("/proxy?url="):]
+            try:
+                req = urllib.request.Request(target_url, headers={
+                    "Referer": REFERER,
+                    "Origin": REFERER,
+                    "User-Agent": "Mozilla/5.0",
+                })
+                if "Range" in self.headers:
+                    req.add_header("Range", self.headers["Range"])
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = resp.read()
+                    self.send_response(resp.status)
+                    for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]:
+                        val = resp.getheader(h)
+                        if val:
+                            self.send_header(h, val)
+                    self.end_headers()
+                    self.wfile.write(body)
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(str(e).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def rewrite_m3u8_urls(m3u8_content: str, proxy_base: str) -> str:
+    """Rewrite all https:// URLs in m3u8 to go through our local proxy."""
+    def replace_url(match):
+        url = match.group(0)
+        return f"{proxy_base}/proxy?url={url}"
+    return re.sub(r'https?://[^\s\r\n]+', replace_url, m3u8_content)
+
+
+def download_with_ffmpeg(m3u8_content: str, output_path: str) -> bool:
+    port = 18899
+    server = HTTPServer(("127.0.0.1", port), M3U8ProxyHandler)
+    server.m3u8_content = rewrite_m3u8_urls(m3u8_content, f"http://127.0.0.1:{port}")
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    log.info(f"  ffmpeg → {output_path} (via proxy :{port})")
     t0 = time.time()
 
     cmd = [
         "ffmpeg", "-y",
-        "-headers", f"Referer: {REFERER}\r\nOrigin: {REFERER}\r\n",
-        "-allowed_extensions", "ALL",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-i", m3u8_path,
+        "-i", f"http://127.0.0.1:{port}/playlist.m3u8",
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         output_path,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    os.unlink(m3u8_path)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    server.shutdown()
     elapsed = time.time() - t0
 
     if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
