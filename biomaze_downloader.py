@@ -30,7 +30,12 @@ logging.basicConfig(
 log = logging.getLogger("biomaze")
 
 
-def extract_all_m3u8(video_url: str) -> dict | None:
+def extract_m3u8_per_quality(video_url: str) -> dict | None:
+    """
+    Opens the video page, captures the master m3u8,
+    then fetches each quality's playlist via network intercept.
+    Returns {quality: m3u8_content} or None on failure.
+    """
     if not video_url.endswith("/iframe"):
         video_url = video_url.rstrip("/") + "/iframe"
 
@@ -42,6 +47,23 @@ def extract_all_m3u8(video_url: str) -> dict | None:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(extra_http_headers={"Referer": REFERER})
             page = context.new_page()
+
+            captured_playlists = {}
+            master_content = [None]
+
+            def on_response(response):
+                url = response.url
+                if ".m3u8" in url:
+                    try:
+                        body = response.text()
+                        if "#EXT-X-STREAM-INF" in body:
+                            master_content[0] = body
+                        elif "#EXTINF" in body:
+                            captured_playlists[url] = body
+                    except:
+                        pass
+
+            page.on("response", on_response)
 
             page.add_init_script("""
                 window.__decryptedM3u8 = [];
@@ -65,73 +87,93 @@ def extract_all_m3u8(video_url: str) -> dict | None:
                 except:
                     continue
 
-            page.wait_for_timeout(6000)
+            page.wait_for_timeout(8000)
 
-            m3u8_list = page.evaluate("() => window.__decryptedM3u8")
-            if not m3u8_list:
+            # Get decrypted m3u8 from TextDecoder hook
+            decrypted = page.evaluate("() => window.__decryptedM3u8")
+
+            if not decrypted:
                 log.warning(f"No m3u8 captured for {video_url}")
                 browser.close()
                 return None
 
-            master = m3u8_list[0]
-            log.debug(f"Master playlist:\n{master[:300]}")
+            # First one is the master
+            master = decrypted[0]
+            log.info(f"Master playlist captured ({len(master)} bytes)")
 
-            qualities = {}
+            # Parse quality URLs from master
+            quality_urls = {}
             lines = master.strip().split("\n")
             for i, line in enumerate(lines):
                 if "#EXT-X-STREAM-INF" in line:
                     name_match = re.search(r'NAME="(\d+)p"', line)
                     if name_match and i + 1 < len(lines):
                         q = name_match.group(1)
-                        qualities[q] = lines[i + 1].strip()
+                        quality_urls[q] = lines[i + 1].strip()
 
-            log.info(f"Master has qualities: {list(qualities.keys())}")
+            log.info(f"Master has qualities: {list(quality_urls.keys())}")
 
-            default_m3u8 = m3u8_list[1] if len(m3u8_list) > 1 else None
-            result = {"master": master, "qualities": qualities, "playlists": {}}
+            # The remaining decrypted m3u8s are quality playlists (decrypted)
+            # We need to match them to the right quality
+            # Strategy: the byte ranges / segment sizes differ per quality
+            # Bigger byteranges = higher quality
+            decrypted_playlists = [d for d in decrypted[1:] if "#EXTINF" in d]
+            log.info(f"Captured {len(decrypted_playlists)} decrypted playlists")
 
+            # For each quality URL in master, try to fetch it directly via page
+            result = {}
             for q in QUALITIES:
-                if q not in qualities:
+                if q not in quality_urls:
+                    log.warning(f"  {q}p not in master, skipping")
                     continue
 
-                page.evaluate("() => { window.__decryptedM3u8 = []; }")
+                q_url = quality_urls[q]
+                log.info(f"  Fetching {q}p playlist: {q_url}")
 
-                page.evaluate(f"""() => {{
-                    for (const k of Object.keys(window)) {{
-                        try {{
-                            const obj = window[k];
-                            if (obj && obj.levels && obj.loadLevel !== undefined) {{
-                                for (let i = 0; i < obj.levels.length; i++) {{
-                                    if (obj.levels[i].height === {q}) {{
-                                        obj.currentLevel = i;
-                                        obj.loadLevel = i;
-                                        break;
-                                    }}
-                                }}
-                            }}
-                        }} catch(e) {{}}
-                    }}
-                }}""")
+                try:
+                    resp = page.evaluate(f"""async () => {{
+                        const r = await fetch("{q_url}", {{
+                            headers: {{"Referer": "{REFERER}"}}
+                        }});
+                        return await r.text();
+                    }}""")
 
-                page.wait_for_timeout(4000)
+                    if resp and "#EXTINF" in resp:
+                        # This is the encrypted version from server
+                        # But the decrypted version from TextDecoder is what we need
+                        # The server response is the actual valid m3u8 with proper URLs
+                        result[q] = resp
+                        log.info(f"  {q}p playlist fetched OK ({len(resp)} bytes)")
+                    else:
+                        log.warning(f"  {q}p fetch returned invalid content")
+                except Exception as e:
+                    log.warning(f"  {q}p fetch failed: {e}")
 
-                new_m3u8 = page.evaluate("() => window.__decryptedM3u8")
-                for m in new_m3u8:
-                    if "#EXT-X-KEY" in m and "#EXT-X-STREAM-INF" not in m:
-                        result["playlists"][q] = m
-                        log.info(f"  Captured {q}p playlist ({len(m)} bytes)")
-                        break
+            # Fallback: if fetch didn't work, use decrypted ones
+            if not result and decrypted_playlists:
+                log.info("  Falling back to decrypted playlists")
+                # Sort by avg byterange size (bigger = higher quality)
+                def avg_byterange(m3u8_text):
+                    ranges = re.findall(r'#EXT-X-BYTERANGE:(\d+)', m3u8_text)
+                    if not ranges:
+                        return 0
+                    return sum(int(r) for r in ranges) / len(ranges)
 
-            if default_m3u8 and "#EXT-X-KEY" in default_m3u8:
-                for q in QUALITIES:
-                    if q not in result["playlists"] and q in qualities:
-                        result["playlists"][q] = default_m3u8
-                        log.info(f"  Using default playlist for {q}p")
+                sorted_playlists = sorted(decrypted_playlists, key=avg_byterange, reverse=True)
+
+                available_q = sorted([q for q in QUALITIES if q in quality_urls],
+                                     key=lambda x: int(x), reverse=True)
+
+                for i, q in enumerate(available_q):
+                    if i < len(sorted_playlists):
+                        result[q] = sorted_playlists[i]
+                        avg_br = avg_byterange(sorted_playlists[i])
+                        log.info(f"  Mapped {q}p ← decrypted playlist (avg byterange: {avg_br:.0f})")
 
             browser.close()
             elapsed = time.time() - t0
-            log.info(f"Extraction done in {elapsed:.1f}s — got {list(result['playlists'].keys())}")
-            return result
+            log.info(f"Extraction done in {elapsed:.1f}s — got qualities: {list(result.keys())}")
+            return result if result else None
 
     except Exception as e:
         log.error(f"Extraction failed for {video_url}: {e}", exc_info=True)
@@ -149,6 +191,8 @@ def download_with_ffmpeg(m3u8_content: str, output_path: str) -> bool:
     cmd = [
         "ffmpeg", "-y",
         "-headers", f"Referer: {REFERER}\r\nOrigin: {REFERER}\r\n",
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
         "-i", m3u8_path,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
@@ -159,13 +203,15 @@ def download_with_ffmpeg(m3u8_content: str, output_path: str) -> bool:
     os.unlink(m3u8_path)
     elapsed = time.time() - t0
 
-    if result.returncode == 0:
+    if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         log.info(f"  ffmpeg done: {size_mb:.1f} MB in {elapsed:.1f}s")
         return True
     else:
         stderr_tail = result.stderr[-500:] if result.stderr else "no stderr"
         log.error(f"  ffmpeg FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
+        if os.path.exists(output_path):
+            os.remove(output_path)
         return False
 
 
@@ -246,51 +292,46 @@ def process_json(json_path: str, output_base: str = "./data"):
             log.info(f"[{done}/{total_links}] ▶ {filename}")
             log.info(f"  URL: {link}")
 
-            # Step 1: Extract m3u8 for all qualities
-            m3u8_data = extract_all_m3u8(link)
-            if not m3u8_data:
+            playlists = extract_m3u8_per_quality(link)
+            if not playlists:
                 log.error(f"  SKIP — m3u8 extraction failed")
                 failed += 1
                 continue
 
-            available = list(m3u8_data["playlists"].keys())
-            log.info(f"  Extracted playlists: {available}")
+            log.info(f"  Extracted qualities: {list(playlists.keys())}")
 
             all_ok = True
 
             for q in QUALITIES:
-                if q not in m3u8_data["playlists"]:
+                if q not in playlists:
                     log.warning(f"  [{q}p] Not available")
                     continue
 
                 out_path = os.path.join(folder_path, q, filename)
 
-                # Step 2: Download with ffmpeg
                 log.info(f"  [{q}p] Downloading...")
-                dl_ok = download_with_ffmpeg(m3u8_data["playlists"][q], out_path)
+                dl_ok = download_with_ffmpeg(playlists[q], out_path)
                 if not dl_ok:
                     all_ok = False
                     log.error(f"  [{q}p] Download failed!")
                     continue
 
-                # Step 3: Upload to HF bucket
                 hf_dest = f"{HF_BUCKET}/{folder_name}/{q}/{filename}"
                 up_ok = upload_file_to_hf(out_path, hf_dest)
 
                 if up_ok:
-                    # Step 4: Delete local file after successful upload
                     os.remove(out_path)
-                    log.info(f"  [{q}p] Local file deleted: {out_path}")
+                    log.info(f"  [{q}p] Local file deleted after upload")
                 else:
                     all_ok = False
-                    log.error(f"  [{q}p] Upload failed — keeping local file: {out_path}")
+                    log.error(f"  [{q}p] Upload failed — keeping local file")
 
             if all_ok:
                 success += 1
             else:
                 failed += 1
 
-            log.info(f"  Progress: {done}/{total_links} done | {success} ok | {failed} failed")
+            log.info(f"  Progress: {done}/{total_links} | ok: {success} | failed: {failed}")
 
     log.info(f"")
     log.info(f"{'='*60}")
