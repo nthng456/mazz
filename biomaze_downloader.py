@@ -1,25 +1,30 @@
 """
 Biomaze Video Downloader
-Downloads videos from stream.biomaze.ir using Playwright + ffmpeg
+Downloads videos from stream.biomaze.ir using Playwright
+Segments downloaded directly with requests, decrypted with pycryptodome
 Uploads to Hugging Face Bucket, then deletes local file to save disk
 """
 
 from playwright.sync_api import sync_playwright
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from Crypto.Cipher import AES
 import subprocess
-import threading
+import requests
 import logging
 import json
 import sys
 import os
 import re
-
 import time
-import urllib.request
 
 REFERER = "https://stream.biomaze.ir"
 QUALITIES = ["1080", "720", "480"]
 HF_BUCKET = "hf://buckets/nthng454/Bucket"
+
+HEADERS = {
+    "Referer": REFERER,
+    "Origin": REFERER,
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,13 +37,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("biomaze")
 
+session = requests.Session()
+session.headers.update(HEADERS)
+
 
 def extract_m3u8_per_quality(video_url: str) -> dict | None:
-    """
-    Opens the video page, captures the master m3u8,
-    then fetches each quality's playlist via network intercept.
-    Returns {quality: m3u8_content} or None on failure.
-    """
     if not video_url.endswith("/iframe"):
         video_url = video_url.rstrip("/") + "/iframe"
 
@@ -50,23 +53,6 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(extra_http_headers={"Referer": REFERER})
             page = context.new_page()
-
-            captured_playlists = {}
-            master_content = [None]
-
-            def on_response(response):
-                url = response.url
-                if ".m3u8" in url:
-                    try:
-                        body = response.text()
-                        if "#EXT-X-STREAM-INF" in body:
-                            master_content[0] = body
-                        elif "#EXTINF" in body:
-                            captured_playlists[url] = body
-                    except:
-                        pass
-
-            page.on("response", on_response)
 
             page.add_init_script("""
                 window.__decryptedM3u8 = [];
@@ -92,19 +78,16 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
 
             page.wait_for_timeout(8000)
 
-            # Get decrypted m3u8 from TextDecoder hook
             decrypted = page.evaluate("() => window.__decryptedM3u8")
+            browser.close()
 
             if not decrypted:
                 log.warning(f"No m3u8 captured for {video_url}")
-                browser.close()
                 return None
 
-            # First one is the master
             master = decrypted[0]
             log.info(f"Master playlist captured ({len(master)} bytes)")
 
-            # Parse quality URLs from master
             quality_urls = {}
             lines = master.strip().split("\n")
             for i, line in enumerate(lines):
@@ -116,66 +99,30 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
 
             log.info(f"Master has qualities: {list(quality_urls.keys())}")
 
-            # The remaining decrypted m3u8s are quality playlists (decrypted)
-            # We need to match them to the right quality
-            # Strategy: the byte ranges / segment sizes differ per quality
-            # Bigger byteranges = higher quality
             decrypted_playlists = [d for d in decrypted[1:] if "#EXTINF" in d]
             log.info(f"Captured {len(decrypted_playlists)} decrypted playlists")
 
-            # For each quality URL in master, try to fetch it directly via page
+            def avg_byterange(m3u8_text):
+                ranges = re.findall(r'#EXT-X-BYTERANGE:(\d+)', m3u8_text)
+                if not ranges:
+                    return 0
+                return sum(int(r) for r in ranges) / len(ranges)
+
+            sorted_playlists = sorted(decrypted_playlists, key=avg_byterange, reverse=True)
+
+            available_q = sorted(
+                [q for q in QUALITIES if q in quality_urls],
+                key=lambda x: int(x), reverse=True,
+            )
+
             result = {}
-            for q in QUALITIES:
-                if q not in quality_urls:
-                    log.warning(f"  {q}p not in master, skipping")
-                    continue
+            for i, q in enumerate(available_q):
+                if i < len(sorted_playlists):
+                    result[q] = sorted_playlists[i]
+                    log.info(f"  Mapped {q}p (avg byterange: {avg_byterange(sorted_playlists[i]):.0f})")
 
-                q_url = quality_urls[q]
-                log.info(f"  Fetching {q}p playlist: {q_url}")
-
-                try:
-                    resp = page.evaluate(f"""async () => {{
-                        const r = await fetch("{q_url}", {{
-                            headers: {{"Referer": "{REFERER}"}}
-                        }});
-                        return await r.text();
-                    }}""")
-
-                    if resp and "#EXTINF" in resp:
-                        # This is the encrypted version from server
-                        # But the decrypted version from TextDecoder is what we need
-                        # The server response is the actual valid m3u8 with proper URLs
-                        result[q] = resp
-                        log.info(f"  {q}p playlist fetched OK ({len(resp)} bytes)")
-                    else:
-                        log.warning(f"  {q}p fetch returned invalid content")
-                except Exception as e:
-                    log.warning(f"  {q}p fetch failed: {e}")
-
-            # Fallback: if fetch didn't work, use decrypted ones
-            if not result and decrypted_playlists:
-                log.info("  Falling back to decrypted playlists")
-                # Sort by avg byterange size (bigger = higher quality)
-                def avg_byterange(m3u8_text):
-                    ranges = re.findall(r'#EXT-X-BYTERANGE:(\d+)', m3u8_text)
-                    if not ranges:
-                        return 0
-                    return sum(int(r) for r in ranges) / len(ranges)
-
-                sorted_playlists = sorted(decrypted_playlists, key=avg_byterange, reverse=True)
-
-                available_q = sorted([q for q in QUALITIES if q in quality_urls],
-                                     key=lambda x: int(x), reverse=True)
-
-                for i, q in enumerate(available_q):
-                    if i < len(sorted_playlists):
-                        result[q] = sorted_playlists[i]
-                        avg_br = avg_byterange(sorted_playlists[i])
-                        log.info(f"  Mapped {q}p ← decrypted playlist (avg byterange: {avg_br:.0f})")
-
-            browser.close()
             elapsed = time.time() - t0
-            log.info(f"Extraction done in {elapsed:.1f}s — got qualities: {list(result.keys())}")
+            log.info(f"Extraction done in {elapsed:.1f}s — got: {list(result.keys())}")
             return result if result else None
 
     except Exception as e:
@@ -183,86 +130,133 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
         return None
 
 
-class M3U8ProxyHandler(BaseHTTPRequestHandler):
-    """Local proxy that serves m3u8 content and proxies segment/key requests with Referer."""
-    m3u8_content = ""
+def parse_segments(m3u8_content: str):
+    """Parse m3u8 playlist and return list of (segment_url, byterange, key_url, iv)."""
+    lines = m3u8_content.strip().split("\n")
+    segments = []
+    current_key_url = None
+    current_iv = None
+    current_byterange = None
 
-    def do_GET(self):
-        if self.path == "/playlist.m3u8":
-            data = self.server.m3u8_content.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        elif self.path.startswith("/proxy?url="):
-            target_url = self.path[len("/proxy?url="):]
-            try:
-                req = urllib.request.Request(target_url, headers={
-                    "Referer": REFERER,
-                    "Origin": REFERER,
-                    "User-Agent": "Mozilla/5.0",
-                })
-                if "Range" in self.headers:
-                    req.add_header("Range", self.headers["Range"])
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    body = resp.read()
-                    self.send_response(resp.status)
-                    for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]:
-                        val = resp.getheader(h)
-                        if val:
-                            self.send_header(h, val)
-                    self.end_headers()
-                    self.wfile.write(body)
-            except Exception as e:
-                self.send_response(502)
-                self.end_headers()
-                self.wfile.write(str(e).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+    for i, line in enumerate(lines):
+        line = line.strip()
 
-    def log_message(self, format, *args):
-        pass
+        if line.startswith("#EXT-X-KEY"):
+            m = re.search(r'URI="([^"]+)"', line)
+            if m:
+                current_key_url = m.group(1)
+            iv_m = re.search(r'IV=0x([0-9a-fA-F]+)', line)
+            if iv_m:
+                current_iv = bytes.fromhex(iv_m.group(1))
+
+        elif line.startswith("#EXT-X-BYTERANGE"):
+            br = line.split(":")[1]
+            parts = br.split("@")
+            length = int(parts[0])
+            offset = int(parts[1]) if len(parts) > 1 else None
+            current_byterange = (length, offset)
+
+        elif line.startswith("http") and not line.startswith("#"):
+            segments.append({
+                "url": line,
+                "byterange": current_byterange,
+                "key_url": current_key_url,
+                "iv": current_iv,
+            })
+            current_byterange = None
+
+    return segments
 
 
-def rewrite_m3u8_urls(m3u8_content: str, proxy_base: str) -> str:
-    """Rewrite all https:// URLs in m3u8 to go through our local proxy."""
-    def replace_url(match):
-        url = match.group(0)
-        return f"{proxy_base}/proxy?url={url}"
-    return re.sub(r'https?://[^\s\r\n]+', replace_url, m3u8_content)
+def download_segment(seg: dict, seg_idx: int) -> bytes | None:
+    url = seg["url"]
+    headers = dict(HEADERS)
+
+    if seg["byterange"]:
+        length, offset = seg["byterange"]
+        if offset is not None:
+            end = offset + length - 1
+            headers["Range"] = f"bytes={offset}-{end}"
+
+    try:
+        resp = session.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        log.error(f"    Segment {seg_idx} download failed: {e}")
+        return None
 
 
-def download_with_ffmpeg(m3u8_content: str, output_path: str) -> bool:
-    port = 18899
-    server = HTTPServer(("127.0.0.1", port), M3U8ProxyHandler)
-    server.m3u8_content = rewrite_m3u8_urls(m3u8_content, f"http://127.0.0.1:{port}")
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-
-    log.info(f"  ffmpeg → {output_path} (via proxy :{port})")
+def download_video(m3u8_content: str, output_path: str) -> bool:
     t0 = time.time()
+    segments = parse_segments(m3u8_content)
+    total = len(segments)
+    log.info(f"  Downloading {total} segments...")
 
+    if total == 0:
+        log.error("  No segments found in playlist")
+        return False
+
+    # Download encryption key once
+    key_cache = {}
+
+    with open(output_path + ".ts", "wb") as out:
+        last_pct = -1
+        for i, seg in enumerate(segments):
+            data = download_segment(seg, i)
+            if data is None:
+                log.error(f"  Aborting at segment {i}/{total}")
+                return False
+
+            # Decrypt if needed
+            if seg["key_url"]:
+                if seg["key_url"] not in key_cache:
+                    kr = session.get(seg["key_url"], headers=HEADERS, timeout=15)
+                    kr.raise_for_status()
+                    key_cache[seg["key_url"]] = kr.content
+                    log.info(f"  Encryption key fetched ({len(kr.content)} bytes)")
+
+                key = key_cache[seg["key_url"]]
+                iv = seg["iv"] if seg["iv"] else i.to_bytes(16, "big")
+                cipher = AES.new(key, AES.MODE_CBC, iv)
+                data = cipher.decrypt(data)
+                # Remove PKCS7 padding
+                pad_len = data[-1]
+                if 0 < pad_len <= 16:
+                    data = data[:-pad_len]
+
+            out.write(data)
+
+            # Progress every 5%
+            pct = int((i + 1) / total * 100)
+            if pct >= last_pct + 5:
+                elapsed = time.time() - t0
+                mb = out.tell() / (1024 * 1024)
+                log.info(f"  Progress: {pct}% ({i+1}/{total}) — {mb:.1f} MB in {elapsed:.0f}s")
+                last_pct = pct
+
+    # Remux TS → MP4 with ffmpeg
+    ts_path = output_path + ".ts"
+    log.info(f"  Remuxing TS → MP4...")
     cmd = [
         "ffmpeg", "-y",
-        "-i", f"http://127.0.0.1:{port}/playlist.m3u8",
+        "-i", ts_path,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         output_path,
     ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    server.shutdown()
-    elapsed = time.time() - t0
+    os.remove(ts_path)
 
     if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        log.info(f"  ffmpeg done: {size_mb:.1f} MB in {elapsed:.1f}s")
+        elapsed = time.time() - t0
+        log.info(f"  Done: {size_mb:.1f} MB in {elapsed:.0f}s")
         return True
     else:
-        stderr_tail = result.stderr[-500:] if result.stderr else "no stderr"
-        log.error(f"  ffmpeg FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
+        stderr = result.stderr[-300:] if result.stderr else "no stderr"
+        log.error(f"  Remux failed: {stderr}")
         if os.path.exists(output_path):
             os.remove(output_path)
         return False
@@ -282,23 +276,6 @@ def upload_file_to_hf(local_path: str, hf_dest: str) -> bool:
     else:
         stderr_tail = result.stderr[-300:] if result.stderr else "no stderr"
         log.error(f"  Upload FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
-        return False
-
-
-def sync_folder_to_hf(local_dir: str) -> bool:
-    cmd = ["hf", "sync", local_dir, HF_BUCKET]
-    log.info(f"Syncing folder: {local_dir} → {HF_BUCKET}")
-    t0 = time.time()
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    elapsed = time.time() - t0
-
-    if result.returncode == 0:
-        log.info(f"Sync OK in {elapsed:.1f}s")
-        return True
-    else:
-        stderr_tail = result.stderr[-300:] if result.stderr else "no stderr"
-        log.error(f"Sync FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
         return False
 
 
@@ -363,7 +340,7 @@ def process_json(json_path: str, output_base: str = "./data"):
                 out_path = os.path.join(folder_path, q, filename)
 
                 log.info(f"  [{q}p] Downloading...")
-                dl_ok = download_with_ffmpeg(playlists[q], out_path)
+                dl_ok = download_video(playlists[q], out_path)
                 if not dl_ok:
                     all_ok = False
                     log.error(f"  [{q}p] Download failed!")

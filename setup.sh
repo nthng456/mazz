@@ -18,8 +18,8 @@ echo "  ✓ ffmpeg installed"
 
 # --- Python deps ---
 echo "[2/5] Installing Python packages..."
-pip install --quiet playwright
-echo "  ✓ playwright installed"
+pip install --quiet playwright requests pycryptodome
+echo "  ✓ playwright, requests, pycryptodome installed"
 
 # --- Playwright browsers ---
 echo "[3/5] Installing Chromium for Playwright..."
