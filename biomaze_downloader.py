@@ -56,6 +56,7 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
 
             page.add_init_script("""
                 window.__decryptedM3u8 = [];
+                window.__capturedQualities = {};
                 const origDecode = TextDecoder.prototype.decode;
                 TextDecoder.prototype.decode = function(...args) {
                     const result = origDecode.apply(this, args);
@@ -76,44 +77,91 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
                 except:
                     continue
 
-            page.wait_for_timeout(8000)
+            page.wait_for_timeout(6000)
 
             decrypted = page.evaluate("() => window.__decryptedM3u8")
-            browser.close()
 
             if not decrypted:
                 log.warning(f"No m3u8 captured for {video_url}")
+                browser.close()
                 return None
 
             master = decrypted[0]
             log.info(f"Master playlist captured ({len(master)} bytes)")
 
-            quality_urls = {}
+            # Parse quality→height mapping from master
+            quality_heights = {}
             lines = master.strip().split("\n")
             for i, line in enumerate(lines):
                 if "#EXT-X-STREAM-INF" in line:
                     name_match = re.search(r'NAME="(\d+)p"', line)
-                    if name_match and i + 1 < len(lines):
+                    res_match = re.search(r'RESOLUTION=\d+x(\d+)', line)
+                    if name_match:
                         q = name_match.group(1)
-                        quality_urls[q] = lines[i + 1].strip()
+                        height = int(res_match.group(1)) if res_match else int(q)
+                        quality_heights[q] = height
 
-            log.info(f"Master has qualities: {list(quality_urls.keys())}")
+            log.info(f"Master has qualities: {list(quality_heights.keys())}")
 
-            decrypted_playlists = [d for d in decrypted[1:] if "#EXTINF" in d]
-            log.info(f"Captured {len(decrypted_playlists)} decrypted playlists")
+            # Collect initial playlists
+            initial_playlists = [d for d in decrypted[1:] if "#EXTINF" in d]
+            log.info(f"Initially captured {len(initial_playlists)} playlists")
 
+            # Now switch to each quality level to capture remaining playlists
+            wanted = [q for q in QUALITIES if q in quality_heights]
+            all_playlists = list(initial_playlists)
+
+            for q in wanted:
+                height = quality_heights[q]
+                # Clear buffer and switch quality
+                page.evaluate("() => { window.__decryptedM3u8 = []; }")
+                page.evaluate(f"""() => {{
+                    try {{
+                        // Find HLS.js instance
+                        for (const k of Object.keys(window)) {{
+                            const obj = window[k];
+                            if (obj && obj.levels && typeof obj.currentLevel !== 'undefined') {{
+                                for (let i = 0; i < obj.levels.length; i++) {{
+                                    if (obj.levels[i].height === {height}) {{
+                                        obj.currentLevel = i;
+                                        break;
+                                    }}
+                                }}
+                                break;
+                            }}
+                        }}
+                    }} catch(e) {{}}
+                }}""")
+                page.wait_for_timeout(3000)
+
+                new_decrypted = page.evaluate("() => window.__decryptedM3u8")
+                new_playlists = [d for d in new_decrypted if "#EXTINF" in d and "#EXT-X-STREAM-INF" not in d]
+                if new_playlists:
+                    all_playlists.extend(new_playlists)
+                    log.info(f"  Captured {q}p playlist via level switch")
+
+            browser.close()
+
+            # Deduplicate playlists by content
+            seen = set()
+            unique_playlists = []
+            for pl in all_playlists:
+                h = hash(pl[:200])
+                if h not in seen:
+                    seen.add(h)
+                    unique_playlists.append(pl)
+
+            log.info(f"Total unique playlists: {len(unique_playlists)}")
+
+            # Match playlists to qualities by avg byterange size
             def avg_byterange(m3u8_text):
                 ranges = re.findall(r'#EXT-X-BYTERANGE:(\d+)', m3u8_text)
                 if not ranges:
                     return 0
                 return sum(int(r) for r in ranges) / len(ranges)
 
-            sorted_playlists = sorted(decrypted_playlists, key=avg_byterange, reverse=True)
-
-            available_q = sorted(
-                [q for q in QUALITIES if q in quality_urls],
-                key=lambda x: int(x), reverse=True,
-            )
+            sorted_playlists = sorted(unique_playlists, key=avg_byterange, reverse=True)
+            available_q = sorted(wanted, key=lambda x: int(x), reverse=True)
 
             result = {}
             for i, q in enumerate(available_q):
@@ -262,9 +310,10 @@ def download_video(m3u8_content: str, output_path: str) -> bool:
         return False
 
 
-def upload_file_to_hf(local_path: str, hf_dest: str) -> bool:
-    cmd = ["hf", "upload", local_path, hf_dest]
-    log.info(f"  Uploading: {os.path.basename(local_path)} → {hf_dest}")
+def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename: str) -> bool:
+    hf_dest_dir = f"{HF_BUCKET}/{folder_name}/{quality}"
+    cmd = ["hf", "upload", local_path, hf_dest_dir]
+    log.info(f"  Uploading: {filename} → {hf_dest_dir}/")
     t0 = time.time()
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -275,7 +324,8 @@ def upload_file_to_hf(local_path: str, hf_dest: str) -> bool:
         return True
     else:
         stderr_tail = result.stderr[-300:] if result.stderr else "no stderr"
-        log.error(f"  Upload FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}")
+        stdout_tail = result.stdout[-300:] if result.stdout else ""
+        log.error(f"  Upload FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}\n{stdout_tail}")
         return False
 
 
@@ -346,8 +396,7 @@ def process_json(json_path: str, output_base: str = "./data"):
                     log.error(f"  [{q}p] Download failed!")
                     continue
 
-                hf_dest = f"{HF_BUCKET}/{folder_name}/{q}/{filename}"
-                up_ok = upload_file_to_hf(out_path, hf_dest)
+                up_ok = upload_file_to_hf(out_path, folder_name, q, filename)
 
                 if up_ok:
                     os.remove(out_path)
