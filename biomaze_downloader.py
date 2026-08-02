@@ -21,7 +21,7 @@ import tempfile
 import time
 
 REFERER = "https://stream.biomaze.ir"
-QUALITIES = ["1080", "720", "480", "360"]
+QUALITIES = ["720"]
 HF_BUCKET = "hf://buckets/nthng454/Bucket"
 HF_BUCKET_ID = HF_BUCKET.split("hf://buckets/", 1)[-1]  # "nthng454/Bucket"
 
