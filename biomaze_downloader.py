@@ -9,11 +9,13 @@ from playwright.sync_api import sync_playwright
 from Crypto.Cipher import AES
 from huggingface_hub import get_bucket_paths_info, sync_bucket
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
 import subprocess
 import requests
 import threading
 import logging
 import base64
+import queue
 import json
 import sys
 import os
@@ -35,6 +37,16 @@ WORKERS = int(os.environ.get("BIOMAZE_WORKERS", "40"))
 # but never from one below this: a 360p fill is more noticeable than the same
 # 4 s at 480p or above.
 FALLBACK_FLOOR = 480
+
+# Hard ceiling on one extraction. A healthy one finishes in ~10-25 s, so this
+# is loose enough not to cut off a slow-but-working page and tight enough that
+# a wedged player costs a minute instead of the whole run.
+EXTRACT_CEILING = int(os.environ.get("BIOMAZE_EXTRACT_CEILING", "90"))
+
+# Extraction failures are usually a transient throttle rather than a bad video,
+# so the same URL is given another go before the video is written off.
+EXTRACT_ATTEMPTS = 3
+RETRY_BACKOFF = 10
 
 HEADERS = {
     "Referer": REFERER,
@@ -277,48 +289,55 @@ def _extract_m3u8_uncapped(video_url: str) -> dict | None:
         return None
 
 
+def _extract_into(q, video_url: str) -> None:
+    """Child-process entry point: run the uncapped body, hand back the result."""
+    try:
+        q.put(_extract_m3u8_uncapped(video_url))
+    except Exception:
+        q.put(None)
+
+
 def extract_m3u8_per_quality(video_url: str) -> dict | None:
     """
-    Cap extraction with a hard deadline.
+    Run extraction under a hard deadline, retrying once.
 
-    Inside the page every await is individually bounded (navigation, fetch
-    signals), but a player wedged on its main thread can still swallow an
-    evaluate and hold the run forever. Playwright's sync API refuses to run in
-    a thread with a live event loop, so the deadline is enforced by running the
-    uncapped body in a fork and killing it past the limit. The body must be
-    importable (guarded by __main__) and only touch pipe-safe objects, both of
-    which hold here.
+    Inside the page each await is bounded individually, but page.evaluate
+    itself takes no timeout, so a player wedged on its main thread can still
+    hold the run forever — which is what stalled it at 41-1.mp4. A thread
+    cannot be killed and Playwright's sync API will not run under asyncio, so
+    the ceiling is enforced with a child process that gets terminated.
+
+    A retry is worth it because the stall is a server-side throttle, not a
+    property of the video: the same URL usually extracts fine moments later.
     """
-    if sys.platform == "win32":
-        # fork() does not exist on Windows. The body is bounded per-await
-        # already, so the worst case is the sum of the per-step ceilings —
-        # bounded in practice, if not by a single watchdog.
-        return _extract_m3u8_uncapped(video_url)
+    for attempt in range(1, EXTRACT_ATTEMPTS + 1):
+        q = mp.Queue()
+        proc = mp.Process(target=_extract_into, args=(q, video_url), daemon=True)
+        proc.start()
 
-    r, w = os.pipe()
-    pid = os.fork()
-    if pid == 0:
         try:
-            os.close(r)
-            res = _extract_m3u8_uncapped(video_url)
-            os.write(w, json.dumps(res).encode("utf-8"))
-            os._exit(0)
-        except Exception:
-            os._exit(1)
+            result = q.get(timeout=EXTRACT_CEILING)
+        except queue.Empty:
+            result = None
+            log.warning(f"  extraction stalled past {EXTRACT_CEILING}s "
+                        f"(attempt {attempt}/{EXTRACT_ATTEMPTS})")
+        finally:
+            # terminate() unconditionally: on the success path the child is
+            # already exiting, and on the stall path it owns a wedged browser
+            # that will not come back on its own.
+            proc.terminate()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            q.close()
 
-    os.close(w)
-    with os.fdopen(r, "rb") as rf:
-        if mp.freeze_support():  # no-op; keeps mp referenced on Windows
-            pass
-        payload = rf.read()
-        if not payload:
-            log.warning(f"Extraction hit the {EXTRACT_CEILING}s ceiling for {video_url}")
-            return None
-        try:
-            return json.loads(payload.decode("utf-8"))
-        except Exception:
-            log.warning(f"Extraction returned invalid JSON for {video_url}")
-            return None
+        if result:
+            return result
+        if attempt < EXTRACT_ATTEMPTS:
+            time.sleep(RETRY_BACKOFF * attempt)
+
+    return None
 
 
 def parse_segments(m3u8_content: str):
@@ -636,6 +655,7 @@ def download_video(m3u8_content: str, output_path: str, label: str = "video",
             # map keeps results in submission order, so the .ts stays correctly
             # ordered while up to WORKERS requests are in flight. It also bounds
             # memory: results are consumed as they are produced, not buffered whole.
+            last_draw = 0.0
             for i, data, from_q in pool.map(get, range(total)):
                 if data is None:
                     # Dropping 4 s keeps the rest of the video usable; the gap
@@ -646,6 +666,17 @@ def download_video(m3u8_content: str, output_path: str, label: str = "video",
                 if from_q:
                     substituted.append((i, from_q))
                 out.write(data)
+
+                # Throttled so a fast download does not spend its time on
+                # terminal writes; the final state is drawn after the loop.
+                now = time.time()
+                if now - last_draw >= 0.2:
+                    progress_bar(i + 1, total, out.tell() / 1048576,
+                                 now - t0, label)
+                    last_draw = now
+
+        progress_bar(total, total, out.tell() / 1048576, time.time() - t0, label)
+    clear_progress_bar()
 
     if substituted:
         by_q = {}
