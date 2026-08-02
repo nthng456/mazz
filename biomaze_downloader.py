@@ -29,7 +29,12 @@ HF_BUCKET_ID = HF_BUCKET.split("hf://buckets/", 1)[-1]  # "nthng454/Bucket"
 
 # Segments are fetched this many at a time. Each is an independent ranged
 # request, so they parallelise cleanly; the .ts is still assembled in order.
-WORKERS = int(os.environ.get("BIOMAZE_WORKERS", "24"))
+WORKERS = int(os.environ.get("BIOMAZE_WORKERS", "40"))
+
+# A segment the CDN has stored truncated is refilled from another rendition,
+# but never from one below this: a 360p fill is more noticeable than the same
+# 4 s at 480p or above.
+FALLBACK_FLOOR = 480
 
 HEADERS = {
     "Referer": REFERER,
@@ -449,19 +454,36 @@ def verify_output(path: str, expected_duration: float, dropped: int) -> bool:
     return True
 
 
+def build_fallback_chain(target: str, playlists: dict) -> list[tuple[str, str]]:
+    """
+    Order the renditions a truncated segment may be refilled from.
+
+    Higher renditions are tried first, nearest first: filling 4 s of 720p from
+    1080p costs only bytes, while filling it from below is visible. Lower ones
+    come next, again nearest first, and stop at FALLBACK_FLOOR.
+
+    So a 720p target reaches for 1080p, then 480p, and never 360p.
+    """
+    t = int(target)
+    higher = sorted((q for q in playlists if int(q) > t), key=int)
+    lower = sorted((q for q in playlists if FALLBACK_FLOOR <= int(q) < t),
+                   key=int, reverse=True)
+    return [(q, playlists[q]) for q in higher + lower]
+
+
 def download_video(m3u8_content: str, output_path: str,
                    fallbacks: list[tuple[str, str]] | None = None) -> bool:
     """
     Assemble one rendition into a .ts, then remux to MP4.
 
-    `fallbacks` is [(quality, playlist_text), ...] in descending quality. When
-    the CDN has a segment stored truncated, the byte range is unrecoverable
-    from this rendition no matter how often it is retried, so the same
-    timestamp is taken from the next rendition down. All renditions here share
-    a segment count and timing, so index i maps to the same 4 s of video, and
-    MPEG-TS tolerates a mid-stream resolution change — this is exactly what the
-    site's own player does when it hits the defect (verified: it dropped
-    1080p->720p at t=1996 s rather than stalling).
+    `fallbacks` is [(quality, playlist_text), ...] tried in order — see
+    build_fallback_chain. When the CDN has a segment stored truncated, that
+    byte range is unrecoverable from this rendition no matter how often it is
+    retried, so the same timestamp is taken from another rendition instead. All
+    renditions share a segment count and timing, so index i is the same 4 s of
+    video, and MPEG-TS tolerates a mid-stream resolution change — which is
+    exactly what the site's own player does when it hits the defect (verified:
+    it dropped 1080p->720p at t=1996 s rather than stalling).
     """
     t0 = time.time()
     segments = parse_segments(m3u8_content)
@@ -761,14 +783,13 @@ def process_json(json_path: str, output_base: str = "./data"):
 
             log.info(f"  [{q}p] Downloading...")
 
-            # Every lower rendition the manifest offers, best first — not
-            # just the ones in QUALITIES, so narrowing QUALITIES to a single
-            # quality does not also remove the recovery path.
-            fallbacks = [
-                (fq, playlists[fq])
-                for fq in sorted(playlists, key=int, reverse=True)
-                if int(fq) < int(q)
-            ]
+            # Higher renditions first, then lower ones down to FALLBACK_FLOOR.
+            # Built from every rendition the manifest offers, not just those in
+            # QUALITIES, so narrowing QUALITIES does not remove the recovery path.
+            fallbacks = build_fallback_chain(q, playlists)
+            if fallbacks:
+                log.info(f"  [{q}p] Fallback order: "
+                         f"{' -> '.join(fq for fq, _ in fallbacks)}")
             dl_ok = download_video(playlists[q], out_path, fallbacks=fallbacks)
             if not dl_ok:
                 all_ok = False
