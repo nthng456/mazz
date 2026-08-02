@@ -285,7 +285,16 @@ def parse_segments(m3u8_content: str):
     return segments
 
 
-def download_segment(seg: dict, seg_idx: int) -> bytes | None:
+def download_segment(seg: dict, seg_idx: int, attempts: int = 3) -> bytes | None:
+    """
+    Fetch one segment, verifying it arrived whole.
+
+    A short body is retried: a network hiccup is transient, but a segment the
+    CDN has stored truncated returns the same short body every time (observed:
+    1080p segment 499 of evgaf5jqtgot serves 144 B of 457792 B for any request
+    shape). Retrying twice distinguishes the two cheaply; a persistent short
+    read is the caller's cue to fall back to another rendition.
+    """
     url = seg["url"]
     headers = dict(HEADERS)
 
@@ -298,21 +307,95 @@ def download_segment(seg: dict, seg_idx: int) -> bytes | None:
         headers["Range"] = f"bytes={offset}-{offset + length - 1}"
         expected = length
 
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = session.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            if expected is not None and len(resp.content) != expected:
+                last = (f"got {len(resp.content)}B of {expected}B "
+                        f"(HTTP {resp.status_code}, "
+                        f"Content-Range={resp.headers.get('Content-Range')})")
+            else:
+                return resp.content
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+
+        if attempt < attempts:
+            time.sleep(attempt)
+
+    log.warning(f"    Segment {seg_idx} incomplete after {attempts} tries — {last}")
+    return None
+
+
+def record_missing(output_path: str, missing: list[int],
+                   substituted: list[tuple[int, str]]) -> None:
+    """
+    Append a gap report next to the output tree.
+
+    Segments the CDN cannot serve in ANY rendition are a defect upstream, so
+    the indices are written out for whoever can purge and re-cache them.
+    """
+    report_path = os.path.join(os.path.dirname(output_path) or ".",
+                               "missing_segments.json")
+    entry = {
+        "file": os.path.basename(output_path),
+        "missing": missing,
+        "substituted": [{"index": i, "from": q} for i, q in substituted],
+    }
     try:
-        resp = session.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        if expected is not None and len(resp.content) != expected:
-            log.error(f"    Segment {seg_idx} size mismatch: "
-                      f"got {len(resp.content)}B, expected {expected}B "
-                      f"(HTTP {resp.status_code} — range ignored by server?)")
-            return None
-        return resp.content
+        existing = []
+        if os.path.exists(report_path):
+            with open(report_path, encoding="utf-8") as f:
+                existing = json.load(f)
+        existing = [e for e in existing if e.get("file") != entry["file"]]
+        existing.append(entry)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
     except Exception as e:
-        log.error(f"    Segment {seg_idx} download failed: {e}")
+        log.warning(f"  Could not write {report_path}: {type(e).__name__}: {e}")
+
+
+def fetch_key(key_url: str, key_cache: dict) -> bytes:
+    if key_url not in key_cache:
+        kr = session.get(key_url, headers=HEADERS, timeout=15)
+        kr.raise_for_status()
+        key_cache[key_url] = kr.content
+        log.info(f"  Encryption key fetched ({len(kr.content)} bytes)")
+    return key_cache[key_url]
+
+
+def fetch_decrypted(seg: dict, seg_idx: int, key_cache: dict) -> bytes | None:
+    """Download one segment and undo its AES-128-CBC layer."""
+    data = download_segment(seg, seg_idx)
+    if data is None:
         return None
 
+    if seg["key_url"]:
+        key = fetch_key(seg["key_url"], key_cache)
+        iv = seg["iv"] if seg["iv"] else seg_idx.to_bytes(16, "big")
+        data = AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+        pad_len = data[-1]
+        if 0 < pad_len <= 16:
+            data = data[:-pad_len]
 
-def download_video(m3u8_content: str, output_path: str) -> bool:
+    return data
+
+
+def download_video(m3u8_content: str, output_path: str,
+                   fallbacks: list[tuple[str, str]] | None = None) -> bool:
+    """
+    Assemble one rendition into a .ts, then remux to MP4.
+
+    `fallbacks` is [(quality, playlist_text), ...] in descending quality. When
+    the CDN has a segment stored truncated, the byte range is unrecoverable
+    from this rendition no matter how often it is retried, so the same
+    timestamp is taken from the next rendition down. All renditions here share
+    a segment count and timing, so index i maps to the same 4 s of video, and
+    MPEG-TS tolerates a mid-stream resolution change — this is exactly what the
+    site's own player does when it hits the defect (verified: it dropped
+    1080p->720p at t=1996 s rather than stalling).
+    """
     t0 = time.time()
     segments = parse_segments(m3u8_content)
     total = len(segments)
@@ -322,43 +405,63 @@ def download_video(m3u8_content: str, output_path: str) -> bool:
         log.error("  No segments found in playlist")
         return False
 
-    # Download encryption key once
+    # Parse fallback playlists lazily — most videos never touch them.
+    alts = []
+    for alt_q, alt_text in (fallbacks or []):
+        alt_segs = parse_segments(alt_text)
+        if len(alt_segs) == total:
+            alts.append((alt_q, alt_segs))
+        else:
+            log.warning(f"  [{alt_q}p] {len(alt_segs)} segments vs {total} — "
+                        f"not usable as a fallback")
+
     key_cache = {}
+    substituted = []
+    missing = []
 
     with open(output_path + ".ts", "wb") as out:
         last_pct = -1
         for i, seg in enumerate(segments):
-            data = download_segment(seg, i)
+            data = fetch_decrypted(seg, i, key_cache)
+
             if data is None:
-                log.error(f"  Aborting at segment {i}/{total}")
-                return False
+                for alt_q, alt_segs in alts:
+                    log.info(f"    Segment {i}: trying {alt_q}p instead")
+                    data = fetch_decrypted(alt_segs[i], i, key_cache)
+                    if data is not None:
+                        substituted.append((i, alt_q))
+                        log.info(f"    Segment {i}: recovered from {alt_q}p "
+                                 f"({len(data)}B)")
+                        break
 
-            # Decrypt if needed
-            if seg["key_url"]:
-                if seg["key_url"] not in key_cache:
-                    kr = session.get(seg["key_url"], headers=HEADERS, timeout=15)
-                    kr.raise_for_status()
-                    key_cache[seg["key_url"]] = kr.content
-                    log.info(f"  Encryption key fetched ({len(kr.content)} bytes)")
-
-                key = key_cache[seg["key_url"]]
-                iv = seg["iv"] if seg["iv"] else i.to_bytes(16, "big")
-                cipher = AES.new(key, AES.MODE_CBC, iv)
-                data = cipher.decrypt(data)
-                # Remove PKCS7 padding
-                pad_len = data[-1]
-                if 0 < pad_len <= 16:
-                    data = data[:-pad_len]
+            if data is None:
+                # Dropping 4 s keeps the rest of the video usable; the gap is
+                # reported so the truncated objects can be purged upstream.
+                missing.append(i)
+                log.error(f"    Segment {i}: unavailable in every rendition — "
+                          f"skipping {seg['byterange'][0] if seg['byterange'] else '?'}B")
+                continue
 
             out.write(data)
 
-            # Progress every 5%
             pct = int((i + 1) / total * 100)
             if pct >= last_pct + 5:
                 elapsed = time.time() - t0
                 mb = out.tell() / (1024 * 1024)
                 log.info(f"  Progress: {pct}% ({i+1}/{total}) — {mb:.1f} MB in {elapsed:.0f}s")
                 last_pct = pct
+
+    if substituted:
+        by_q = {}
+        for idx, q in substituted:
+            by_q.setdefault(q, []).append(idx)
+        detail = ", ".join(f"{len(v)} from {k}p" for k, v in by_q.items())
+        log.warning(f"  {len(substituted)} segment(s) substituted ({detail})")
+
+    if missing:
+        log.error(f"  {len(missing)} segment(s) lost entirely: {missing[:20]}"
+                  f"{' ...' if len(missing) > 20 else ''}")
+        record_missing(output_path, missing, substituted)
 
     # Remux TS → MP4 with ffmpeg
     ts_path = output_path + ".ts"
@@ -512,7 +615,12 @@ def process_json(json_path: str, output_base: str = "./data"):
                 out_path = os.path.join(folder_path, q, filename)
 
                 log.info(f"  [{q}p] Downloading...")
-                dl_ok = download_video(playlists[q], out_path)
+
+                fallbacks = [  # lower renditions, best first — used only on short segments
+                    (fq, playlists[fq]) for fq in QUALITIES
+                    if fq in playlists and int(fq) < int(q)
+                ]
+                dl_ok = download_video(playlists[q], out_path, fallbacks=fallbacks)
                 if not dl_ok:
                     all_ok = False
                     log.error(f"  [{q}p] Download failed!")
