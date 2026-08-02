@@ -29,7 +29,7 @@ HF_BUCKET_ID = HF_BUCKET.split("hf://buckets/", 1)[-1]  # "nthng454/Bucket"
 
 # Segments are fetched this many at a time. Each is an independent ranged
 # request, so they parallelise cleanly; the .ts is still assembled in order.
-WORKERS = int(os.environ.get("BIOMAZE_WORKERS", "5"))
+WORKERS = int(os.environ.get("BIOMAZE_WORKERS", "24"))
 
 HEADERS = {
     "Referer": REFERER,
