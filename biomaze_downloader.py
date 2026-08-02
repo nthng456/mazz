@@ -141,21 +141,28 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
 
             page.goto(video_url, wait_until="domcontentloaded", timeout=60000)
 
-            # Click as soon as a play target exists rather than after a fixed
-            # pause: the player usually mounts well under a second.
-            for selector in [".media", "video", "[class*='play']"]:
-                try:
-                    page.click(selector, timeout=2500)
-                    break
-                except Exception:
-                    continue
+            def try_play():
+                """Click whatever starts playback. Silent no-op if nothing matches."""
+                for selector in [".media", "video", "[class*='play']"]:
+                    try:
+                        page.click(selector, timeout=1500)
+                        return True
+                    except Exception:
+                        continue
+                return False
+
+            # Let the player's JS attach its handlers before clicking: a click
+            # that lands first is silently swallowed and playback never starts.
+            page.wait_for_timeout(1500)
+            try_play()
 
             # Poll for what is actually needed — the manifest key and at least
-            # one master playlist — instead of waiting out the worst case. The
-            # player typically has both within a couple of seconds, so this
-            # returns as soon as they land and only reaches the ceiling when
-            # something is genuinely slow.
-            deadline = time.time() + 20
+            # one master playlist — rather than waiting out the worst case, and
+            # re-click periodically since a click can still land too early on a
+            # slow mount. Without the retry a missed click means a dead 20 s and
+            # a failed extraction.
+            deadline = time.time() + 25
+            next_retry = time.time() + 4
             cap = None
             while time.time() < deadline:
                 cap = page.evaluate("() => window.__C")
@@ -163,6 +170,9 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
                                for d in cap["decrypts"])
                 if have_key and cap["raw"]:
                     break
+                if time.time() >= next_retry:
+                    try_play()
+                    next_retry = time.time() + 4
                 page.wait_for_timeout(250)
 
             key_b64 = next((d["keyB64"] for d in (cap or {}).get("decrypts", [])
