@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor
+.vscode/
+
+# Recon artifacts — these embed per-session AES keys, never commit
+recon.json
+crypto.json
+chain.json
+variants.json
+verify.json
+
+# Downloaded / intermediate media
+data/
+*.ts
+*.mp4
+probe_*.ts
+
+# Upload staging used during testing
+hftest/
+hftest2/
+
+# Runtime
+downloader.log

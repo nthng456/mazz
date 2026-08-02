@@ -7,18 +7,23 @@ Uploads to Hugging Face Bucket, then deletes local file to save disk
 
 from playwright.sync_api import sync_playwright
 from Crypto.Cipher import AES
+from huggingface_hub import get_bucket_paths_info, sync_bucket
 import subprocess
 import requests
 import logging
+import base64
 import json
 import sys
 import os
 import re
+import shutil
+import tempfile
 import time
 
 REFERER = "https://stream.biomaze.ir"
-QUALITIES = ["1080", "720", "480"]
+QUALITIES = ["1080", "720", "480", "360"]
 HF_BUCKET = "hf://buckets/nthng454/Bucket"
+HF_BUCKET_ID = HF_BUCKET.split("hf://buckets/", 1)[-1]  # "nthng454/Bucket"
 
 HEADERS = {
     "Referer": REFERER,
@@ -41,7 +46,65 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 
+# Hooks crypto.subtle to lift the per-page-load AES-256-GCM manifest key, and
+# records the raw (still encrypted) hex bodies of every .m3u8 the player fetches.
+INIT_SCRIPT = r"""
+window.__C = { decrypts: [], raw: [] };
+const b64 = (b) => { const u=new Uint8Array(b); let s=''; for(let i=0;i<u.length;i++) s+=String.fromCharCode(u[i]); return btoa(s); };
+const buf = (x) => !x ? null : (x instanceof ArrayBuffer ? x : (x.buffer ? x.buffer.slice(x.byteOffset,x.byteOffset+x.byteLength) : null));
+
+const oOpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(m,u,...r){ this.__u=String(u); return oOpen.call(this,m,u,...r); };
+const oSend = XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.send = function(...a){
+    this.addEventListener('load', () => {
+        if (this.__u && this.__u.indexOf('.m3u8')!==-1 && typeof this.response==='string')
+            window.__C.raw.push({ url:this.__u, full:this.response });
+    });
+    return oSend.apply(this,a);
+};
+
+const S = crypto.subtle, km = new WeakMap();
+const oImp = S.importKey;
+S.importKey = function(f,kd){ const kb=buf(kd);
+    return oImp.apply(this,arguments).then(k=>{ km.set(k,{b64:kb?b64(kb):null}); return k; }); };
+const oDec = S.decrypt;
+S.decrypt = function(algo,key,data){
+    const rec = { keyB64:(km.get(key)||{}).b64 };
+    window.__C.decrypts.push(rec);
+    return oDec.apply(this,arguments).then(o=>{
+        try { rec.isM3u8 = new TextDecoder().decode(o).indexOf('#EXTM3U')!==-1; } catch(e){}
+        return o;
+    });
+};
+"""
+
+
+def decrypt_manifest(raw_hex: str, key: bytes) -> str | None:
+    """
+    Wire format: hex(IV 12B) || hex(ciphertext||GCM tag 16B) || trailer.
+    The trailer length is not constant between manifests, so sweep it and let
+    the GCM tag confirm the correct boundary.
+    """
+    for trailer in range(0, 80):
+        end = len(raw_hex) - trailer
+        if (end - 24) % 2:
+            continue
+        try:
+            iv = bytes.fromhex(raw_hex[:24])
+            blob = bytes.fromhex(raw_hex[24:end])
+            out = AES.new(key, AES.MODE_GCM, nonce=iv).decrypt_and_verify(blob[:-16], blob[-16:])
+        except Exception:
+            continue
+        return out.decode("utf-8")
+    return None
+
+
 def extract_m3u8_per_quality(video_url: str) -> dict | None:
+    """
+    Returns {quality: playlist_text}, mapped explicitly from the master
+    playlist's NAME= attribute — never guessed from segment sizes.
+    """
     if not video_url.endswith("/iframe"):
         video_url = video_url.rstrip("/") + "/iframe"
 
@@ -53,121 +116,103 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(extra_http_headers={"Referer": REFERER})
             page = context.new_page()
+            page.add_init_script(INIT_SCRIPT)
 
-            page.add_init_script("""
-                window.__decryptedM3u8 = [];
-                window.__capturedQualities = {};
-                const origDecode = TextDecoder.prototype.decode;
-                TextDecoder.prototype.decode = function(...args) {
-                    const result = origDecode.apply(this, args);
-                    if (result && typeof result === 'string' && result.includes('#EXTM3U')) {
-                        window.__decryptedM3u8.push(result);
-                    }
-                    return result;
-                };
-            """)
+            page.goto(video_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3000)
 
-            page.goto(video_url, wait_until="networkidle")
-            page.wait_for_timeout(2000)
-
-            for selector in ["video", "[class*='play']", ".media"]:
+            for selector in [".media", "video", "[class*='play']"]:
                 try:
                     page.click(selector, timeout=3000)
                     break
-                except:
+                except Exception:
                     continue
 
-            page.wait_for_timeout(6000)
+            page.wait_for_timeout(9000)
 
-            decrypted = page.evaluate("() => window.__decryptedM3u8")
+            cap = page.evaluate("() => window.__C")
 
-            if not decrypted:
-                log.warning(f"No m3u8 captured for {video_url}")
+            key_b64 = next((d["keyB64"] for d in cap["decrypts"]
+                            if d.get("isM3u8") and d.get("keyB64")), None)
+            if not key_b64:
+                log.warning(f"No manifest key captured for {video_url}")
                 browser.close()
                 return None
 
-            master = decrypted[0]
-            log.info(f"Master playlist captured ({len(master)} bytes)")
+            key = base64.b64decode(key_b64)
+            log.info(f"Session manifest key captured ({len(key)} bytes)")
 
-            # Parse quality→height mapping from master
-            quality_heights = {}
-            lines = master.strip().split("\n")
+            master = None
+            for r in cap["raw"]:
+                text = decrypt_manifest(r["full"], key)
+                if text and "#EXT-X-STREAM-INF" in text:
+                    master = text
+                    break
+
+            if not master:
+                log.warning(f"Master playlist not found for {video_url}")
+                browser.close()
+                return None
+
+            # The master playlist states each variant's URL outright.
+            variants = {}
+            lines = master.strip().splitlines()
             for i, line in enumerate(lines):
-                if "#EXT-X-STREAM-INF" in line:
-                    name_match = re.search(r'NAME="(\d+)p"', line)
-                    res_match = re.search(r'RESOLUTION=\d+x(\d+)', line)
-                    if name_match:
-                        q = name_match.group(1)
-                        height = int(res_match.group(1)) if res_match else int(q)
-                        quality_heights[q] = height
+                if line.startswith("#EXT-X-STREAM-INF"):
+                    name = re.search(r'NAME="(\d+)p"', line)
+                    res = re.search(r"RESOLUTION=\d+x(\d+)", line)
+                    q = name.group(1) if name else (res.group(1) if res else None)
+                    if q and i + 1 < len(lines):
+                        variants[q] = lines[i + 1].strip()
 
-            log.info(f"Master has qualities: {list(quality_heights.keys())}")
+            log.info(f"Master declares qualities: {sorted(variants, key=int, reverse=True)}")
 
-            # Collect initial playlists
-            initial_playlists = [d for d in decrypted[1:] if "#EXTINF" in d]
-            log.info(f"Initially captured {len(initial_playlists)} playlists")
+            wanted = {q: u for q, u in variants.items() if q in QUALITIES}
+            if not wanted:
+                log.warning(f"None of {QUALITIES} present in master")
+                browser.close()
+                return None
 
-            # Now switch to each quality level to capture remaining playlists
-            wanted = [q for q in QUALITIES if q in quality_heights]
-            all_playlists = list(initial_playlists)
-
-            for q in wanted:
-                height = quality_heights[q]
-                # Clear buffer and switch quality
-                page.evaluate("() => { window.__decryptedM3u8 = []; }")
-                page.evaluate(f"""() => {{
-                    try {{
-                        // Find HLS.js instance
-                        for (const k of Object.keys(window)) {{
-                            const obj = window[k];
-                            if (obj && obj.levels && typeof obj.currentLevel !== 'undefined') {{
-                                for (let i = 0; i < obj.levels.length; i++) {{
-                                    if (obj.levels[i].height === {height}) {{
-                                        obj.currentLevel = i;
-                                        break;
-                                    }}
-                                }}
-                                break;
-                            }}
-                        }}
-                    }} catch(e) {{}}
-                }}""")
-                page.wait_for_timeout(3000)
-
-                new_decrypted = page.evaluate("() => window.__decryptedM3u8")
-                new_playlists = [d for d in new_decrypted if "#EXTINF" in d and "#EXT-X-STREAM-INF" not in d]
-                if new_playlists:
-                    all_playlists.extend(new_playlists)
-                    log.info(f"  Captured {q}p playlist via level switch")
+            # Fetch from inside the page: the endpoint returns an empty body
+            # unless the request carries a Referer/Origin for the site.
+            fetched = page.evaluate("""async (urls) => {
+                const out = {};
+                for (const u of urls) {
+                    try {
+                        const r = await fetch(u);
+                        out[u] = await r.text();
+                    } catch (e) { out[u] = ''; }
+                }
+                return out;
+            }""", list(wanted.values()))
 
             browser.close()
 
-            # Deduplicate playlists by content
-            seen = set()
-            unique_playlists = []
-            for pl in all_playlists:
-                h = hash(pl[:200])
-                if h not in seen:
-                    seen.add(h)
-                    unique_playlists.append(pl)
-
-            log.info(f"Total unique playlists: {len(unique_playlists)}")
-
-            # Match playlists to qualities by avg byterange size
-            def avg_byterange(m3u8_text):
-                ranges = re.findall(r'#EXT-X-BYTERANGE:(\d+)', m3u8_text)
-                if not ranges:
-                    return 0
-                return sum(int(r) for r in ranges) / len(ranges)
-
-            sorted_playlists = sorted(unique_playlists, key=avg_byterange, reverse=True)
-            available_q = sorted(wanted, key=lambda x: int(x), reverse=True)
-
             result = {}
-            for i, q in enumerate(available_q):
-                if i < len(sorted_playlists):
-                    result[q] = sorted_playlists[i]
-                    log.info(f"  Mapped {q}p (avg byterange: {avg_byterange(sorted_playlists[i]):.0f})")
+            for q, u in sorted(wanted.items(), key=lambda kv: int(kv[0]), reverse=True):
+                raw = fetched.get(u) or ""
+                if not raw:
+                    log.warning(f"  [{q}p] empty manifest response")
+                    continue
+                text = decrypt_manifest(raw, key)
+                if not text:
+                    log.warning(f"  [{q}p] decrypt failed ({len(raw)} raw chars)")
+                    continue
+
+                segs = text.count("#EXTINF")
+                dur = sum(float(x) for x in re.findall(r"#EXTINF:([\d.]+)", text))
+                size = sum(int(a) for a, _ in re.findall(r"#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?", text))
+                if "#EXT-X-ENDLIST" not in text:
+                    log.warning(f"  [{q}p] playlist has no #EXT-X-ENDLIST — may be truncated")
+
+                result[q] = text
+                log.info(f"  [{q}p] {segs} segments, {dur:.0f}s, {size / 1048576:.0f} MB")
+
+            # Distinct playlists are the guard against silently mapping the
+            # same variant to several quality labels.
+            if len(set(result.values())) != len(result):
+                log.error("  Duplicate playlists across qualities — aborting")
+                return None
 
             elapsed = time.time() - t0
             log.info(f"Extraction done in {elapsed:.1f}s — got: {list(result.keys())}")
@@ -179,12 +224,20 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
 
 
 def parse_segments(m3u8_content: str):
-    """Parse m3u8 playlist and return list of (segment_url, byterange, key_url, iv)."""
+    """
+    Parse an m3u8 playlist into segments.
+
+    Per the HLS spec, #EXT-X-BYTERANGE without an @offset continues from the
+    end of the previous range on the SAME resource, so the running offset is
+    tracked per segment URL here.
+    """
     lines = m3u8_content.strip().split("\n")
     segments = []
     current_key_url = None
     current_iv = None
     current_byterange = None
+    last_url = None
+    running_offset = 0
 
     for i, line in enumerate(lines):
         line = line.strip()
@@ -205,13 +258,29 @@ def parse_segments(m3u8_content: str):
             current_byterange = (length, offset)
 
         elif line.startswith("http") and not line.startswith("#"):
-            segments.append({
-                "url": line,
-                "byterange": current_byterange,
-                "key_url": current_key_url,
-                "iv": current_iv,
-            })
-            current_byterange = None
+            if current_byterange:
+                length, offset = current_byterange
+                if offset is None:
+                    if last_url == line:
+                        offset = running_offset
+                    else:
+                        offset = 0
+                segments.append({
+                    "url": line,
+                    "byterange": (length, offset),
+                    "key_url": current_key_url,
+                    "iv": current_iv,
+                })
+                running_offset = offset + length
+                last_url = line
+                current_byterange = None
+            else:
+                segments.append({
+                    "url": line,
+                    "byterange": None,
+                    "key_url": current_key_url,
+                    "iv": current_iv,
+                })
 
     return segments
 
@@ -220,15 +289,23 @@ def download_segment(seg: dict, seg_idx: int) -> bytes | None:
     url = seg["url"]
     headers = dict(HEADERS)
 
+    expected = None
     if seg["byterange"]:
         length, offset = seg["byterange"]
-        if offset is not None:
-            end = offset + length - 1
-            headers["Range"] = f"bytes={offset}-{end}"
+        if offset is None:
+            log.error(f"    Segment {seg_idx} has an unresolved byterange offset")
+            return None
+        headers["Range"] = f"bytes={offset}-{offset + length - 1}"
+        expected = length
 
     try:
         resp = session.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
+        if expected is not None and len(resp.content) != expected:
+            log.error(f"    Segment {seg_idx} size mismatch: "
+                      f"got {len(resp.content)}B, expected {expected}B "
+                      f"(HTTP {resp.status_code} — range ignored by server?)")
+            return None
         return resp.content
     except Exception as e:
         log.error(f"    Segment {seg_idx} download failed: {e}")
@@ -311,22 +388,67 @@ def download_video(m3u8_content: str, output_path: str) -> bool:
 
 
 def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename: str) -> bool:
+    """
+    Upload one file into the bucket via huggingface_hub.
+
+    Uses sync_bucket rather than shelling out to `hf upload`: the CLI treats
+    both of its positional args as local paths, so an `hf://buckets/...`
+    destination is rejected. sync_bucket works on a directory, so the file is
+    staged alone in a temp dir to avoid re-uploading siblings.
+    """
     hf_dest_dir = f"{HF_BUCKET}/{folder_name}/{quality}"
-    cmd = ["hf", "upload", local_path, hf_dest_dir]
     log.info(f"  Uploading: {filename} → {hf_dest_dir}/")
     t0 = time.time()
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    elapsed = time.time() - t0
+    staging = None
+    try:
+        staging = tempfile.mkdtemp(prefix="hfup_")
+        shutil.copy2(local_path, os.path.join(staging, filename))
 
-    if result.returncode == 0:
-        log.info(f"  Upload OK in {elapsed:.1f}s")
-        return True
-    else:
-        stderr_tail = result.stderr[-300:] if result.stderr else "no stderr"
-        stdout_tail = result.stdout[-300:] if result.stdout else ""
-        log.error(f"  Upload FAILED (code {result.returncode}) in {elapsed:.1f}s\n{stderr_tail}\n{stdout_tail}")
+        plan = sync_bucket(
+            staging, hf_dest_dir,
+            quiet=True,
+            token=os.environ.get("HF_TOKEN") or True,  # reuse stored login if no env token
+        )
+        elapsed = time.time() - t0
+
+        uploaded = [op for op in plan.operations if op.action == "upload"]
+        if not uploaded:
+            skipped = [op for op in plan.operations if op.action == "skip"]
+            if skipped:
+                log.info(f"  Upload skipped (already present) in {elapsed:.1f}s")
+                return True
+            log.error(f"  Upload produced no operations — nothing was sent")
+            return False
+
+        # Confirm the object is actually in the bucket rather than trusting the plan.
+        # get_bucket_paths_info returns the logical size (metadata's `size` is the
+        # deduplicated xet size, which differs and would false-negative).
+        remote = f"{folder_name}/{quality}/{filename}"
+        try:
+            remote_info = list(get_bucket_paths_info(HF_BUCKET_ID, [remote]))
+            if not remote_info:
+                log.error(f"  Upload verification failed — {remote} not found in bucket")
+                return False
+            local_size = os.path.getsize(local_path)
+            if remote_info[0].size != local_size:
+                log.error(f"  Upload size mismatch: remote {remote_info[0].size}B vs "
+                          f"local {local_size}B")
+                return False
+            log.info(f"  Upload OK in {elapsed:.1f}s "
+                     f"({remote_info[0].size / 1048576:.1f} MB verified)")
+            return True
+        except Exception as e:
+            log.error(f"  Upload verification failed for {remote}: "
+                      f"{type(e).__name__}: {e}")
+            return False
+
+    except Exception as e:
+        log.error(f"  Upload FAILED in {time.time() - t0:.1f}s — {type(e).__name__}: {e}")
         return False
+    finally:
+        if staging and os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def process_json(json_path: str, output_base: str = "./data"):
