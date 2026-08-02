@@ -8,8 +8,10 @@ Uploads to Hugging Face Bucket, then deletes local file to save disk
 from playwright.sync_api import sync_playwright
 from Crypto.Cipher import AES
 from huggingface_hub import get_bucket_paths_info, sync_bucket
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import requests
+import threading
 import logging
 import base64
 import json
@@ -24,6 +26,10 @@ REFERER = "https://stream.biomaze.ir"
 QUALITIES = ["720"]
 HF_BUCKET = "hf://buckets/nthng454/Bucket"
 HF_BUCKET_ID = HF_BUCKET.split("hf://buckets/", 1)[-1]  # "nthng454/Bucket"
+
+# Segments are fetched this many at a time. Each is an independent ranged
+# request, so they parallelise cleanly; the .ts is still assembled in order.
+WORKERS = int(os.environ.get("BIOMAZE_WORKERS", "5"))
 
 HEADERS = {
     "Referer": REFERER,
@@ -44,6 +50,12 @@ log = logging.getLogger("biomaze")
 
 session = requests.Session()
 session.headers.update(HEADERS)
+# Match the pool to the worker count: past the default of 10, urllib3 discards
+# and reopens connections on every request, which costs a TLS handshake each time.
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=WORKERS * 2, pool_maxsize=WORKERS * 2, max_retries=0)
+session.mount("https://", _adapter)
+session.mount("http://", _adapter)
 
 
 # Hooks crypto.subtle to lift the per-page-load AES-256-GCM manifest key, and
@@ -167,9 +179,12 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
 
             log.info(f"Master declares qualities: {sorted(variants, key=int, reverse=True)}")
 
-            wanted = {q: u for q, u in variants.items() if q in QUALITIES}
+            # Fetch every rendition the master offers, not only the ones in
+            # QUALITIES: the lower ones are the recovery path for segments the
+            # CDN has stored truncated. Which ones get saved is decided later.
+            wanted = dict(variants)
             if not wanted:
-                log.warning(f"None of {QUALITIES} present in master")
+                log.warning("Master declared no usable variants")
                 browser.close()
                 return None
 
@@ -356,13 +371,18 @@ def record_missing(output_path: str, missing: list[int],
         log.warning(f"  Could not write {report_path}: {type(e).__name__}: {e}")
 
 
+_key_lock = threading.Lock()
+
+
 def fetch_key(key_url: str, key_cache: dict) -> bytes:
-    if key_url not in key_cache:
-        kr = session.get(key_url, headers=HEADERS, timeout=15)
-        kr.raise_for_status()
-        key_cache[key_url] = kr.content
-        log.info(f"  Encryption key fetched ({len(kr.content)} bytes)")
-    return key_cache[key_url]
+    """Fetch an AES-128 key once. Called from worker threads, hence the lock."""
+    with _key_lock:
+        if key_url not in key_cache:
+            kr = session.get(key_url, headers=HEADERS, timeout=15)
+            kr.raise_for_status()
+            key_cache[key_url] = kr.content
+            log.info(f"  Encryption key fetched ({len(kr.content)} bytes)")
+        return key_cache[key_url]
 
 
 def fetch_decrypted(seg: dict, seg_idx: int, key_cache: dict) -> bytes | None:
@@ -380,6 +400,53 @@ def fetch_decrypted(seg: dict, seg_idx: int, key_cache: dict) -> bytes | None:
             data = data[:-pad_len]
 
     return data
+
+
+def verify_output(path: str, expected_duration: float, dropped: int) -> bool:
+    """
+    Sanity-check the remuxed file against what the playlist promised.
+
+    A container probe is nearly free and catches the failure that matters here:
+    segments missing from the middle of the file. ffprobe reads headers only —
+    it does not decode — so it will not notice a corrupt frame; the per-segment
+    size check during download is what guards that.
+    """
+    try:
+        pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type", "-of", "json", path],
+            capture_output=True, text=True, timeout=60)
+        info = json.loads(pr.stdout or "{}")
+    except Exception as e:
+        log.error(f"  Verify failed to probe: {type(e).__name__}: {e}")
+        return False
+
+    kinds = {s.get("codec_type") for s in info.get("streams", [])}
+    if "video" not in kinds:
+        log.error(f"  Verify failed: no video stream (streams: {kinds or 'none'})")
+        return False
+
+    try:
+        actual = float(info["format"]["duration"])
+    except (KeyError, TypeError, ValueError):
+        log.error("  Verify failed: ffprobe reported no duration")
+        return False
+
+    if expected_duration <= 0:
+        log.info(f"  Verified: {actual:.0f}s, streams={sorted(kinds)}")
+        return True
+
+    drift = abs(actual - expected_duration)
+    pct = drift / expected_duration * 100
+    if pct > 2:
+        log.error(f"  Verify FAILED: {actual:.0f}s vs {expected_duration:.0f}s "
+                  f"expected — off by {drift:.0f}s ({pct:.1f}%)"
+                  + (f", {dropped} segment(s) were dropped" if dropped else ""))
+        return False
+
+    log.info(f"  Verified: {actual:.0f}s vs {expected_duration:.0f}s expected "
+             f"({pct:.1f}% drift), streams={sorted(kinds)}")
+    return True
 
 
 def download_video(m3u8_content: str, output_path: str,
@@ -419,37 +486,53 @@ def download_video(m3u8_content: str, output_path: str,
     substituted = []
     missing = []
 
+    # Fetch the AES key up front: with several threads running, doing it lazily
+    # would have them all race to fetch the same key on the first segment.
+    if segments[0]["key_url"]:
+        fetch_key(segments[0]["key_url"], key_cache)
+
+    def get(i):
+        """Resolve segment i, falling back down the renditions if truncated."""
+        data = fetch_decrypted(segments[i], i, key_cache)
+        if data is not None:
+            return i, data, None
+
+        for alt_q, alt_segs in alts:
+            log.info(f"    Segment {i}: trying {alt_q}p instead")
+            data = fetch_decrypted(alt_segs[i], i, key_cache)
+            if data is not None:
+                log.info(f"    Segment {i}: recovered from {alt_q}p ({len(data)}B)")
+                return i, data, alt_q
+        return i, None, None
+
     with open(output_path + ".ts", "wb") as out:
         last_pct = -1
-        for i, seg in enumerate(segments):
-            data = fetch_decrypted(seg, i, key_cache)
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            # map keeps results in submission order, so the .ts stays correctly
+            # ordered while up to WORKERS requests are in flight. It also bounds
+            # memory: results are consumed as they are produced, not buffered whole.
+            for i, data, from_q in pool.map(get, range(total)):
+                if data is None:
+                    # Dropping 4 s keeps the rest of the video usable; the gap
+                    # is reported so the objects can be purged upstream.
+                    missing.append(i)
+                    want = segments[i]["byterange"][0] if segments[i]["byterange"] else "?"
+                    log.error(f"    Segment {i}: unavailable in every rendition — "
+                              f"skipping {want}B")
+                    continue
 
-            if data is None:
-                for alt_q, alt_segs in alts:
-                    log.info(f"    Segment {i}: trying {alt_q}p instead")
-                    data = fetch_decrypted(alt_segs[i], i, key_cache)
-                    if data is not None:
-                        substituted.append((i, alt_q))
-                        log.info(f"    Segment {i}: recovered from {alt_q}p "
-                                 f"({len(data)}B)")
-                        break
+                if from_q:
+                    substituted.append((i, from_q))
+                out.write(data)
 
-            if data is None:
-                # Dropping 4 s keeps the rest of the video usable; the gap is
-                # reported so the truncated objects can be purged upstream.
-                missing.append(i)
-                log.error(f"    Segment {i}: unavailable in every rendition — "
-                          f"skipping {seg['byterange'][0] if seg['byterange'] else '?'}B")
-                continue
-
-            out.write(data)
-
-            pct = int((i + 1) / total * 100)
-            if pct >= last_pct + 5:
-                elapsed = time.time() - t0
-                mb = out.tell() / (1024 * 1024)
-                log.info(f"  Progress: {pct}% ({i+1}/{total}) — {mb:.1f} MB in {elapsed:.0f}s")
-                last_pct = pct
+                pct = int((i + 1) / total * 100)
+                if pct >= last_pct + 5:
+                    elapsed = time.time() - t0
+                    mb = out.tell() / (1024 * 1024)
+                    rate = mb / elapsed if elapsed else 0
+                    log.info(f"  Progress: {pct}% ({i+1}/{total}) — "
+                             f"{mb:.1f} MB in {elapsed:.0f}s ({rate:.1f} MB/s)")
+                    last_pct = pct
 
     if substituted:
         by_q = {}
@@ -480,6 +563,14 @@ def download_video(m3u8_content: str, output_path: str,
     if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         elapsed = time.time() - t0
+
+        # The playlist states the duration outright, so compare against it: a
+        # file short by whole segments is the failure this catches.
+        expected = sum(float(x) for x in re.findall(r"#EXTINF:([\d.]+)", m3u8_content))
+        if not verify_output(output_path, expected, len(missing)):
+            os.remove(output_path)
+            return False
+
         log.info(f"  Done: {size_mb:.1f} MB in {elapsed:.0f}s")
         return True
     else:
@@ -488,6 +579,34 @@ def download_video(m3u8_content: str, output_path: str,
         if os.path.exists(output_path):
             os.remove(output_path)
         return False
+
+
+def already_on_hf(folder_name: str, quality: str, filename: str) -> bool:
+    """
+    True if this file is already in the bucket, so the download can be skipped.
+
+    Failures here return False: a network blip should cost a re-download, not
+    silently mark a video as done when nothing was ever uploaded.
+    """
+    remote = f"{folder_name}/{quality}/{filename}"
+    try:
+        info = list(get_bucket_paths_info(HF_BUCKET_ID, [remote]))
+    except Exception as e:
+        log.warning(f"  [{quality}p] Could not check the bucket "
+                    f"({type(e).__name__}: {e}) — downloading anyway")
+        return False
+
+    if not info:
+        return False
+
+    size = getattr(info[0], "size", 0) or 0
+    if size <= 1024:
+        log.warning(f"  [{quality}p] {remote} exists but is only {size}B "
+                    f"— treating as incomplete, re-downloading")
+        return False
+
+    log.info(f"  [{quality}p] Already on HF ({size / 1048576:.1f} MB) — skipping")
+    return True
 
 
 def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename: str) -> bool:
@@ -614,11 +733,18 @@ def process_json(json_path: str, output_base: str = "./data"):
 
                 out_path = os.path.join(folder_path, q, filename)
 
+                if already_on_hf(folder_name, q, filename):
+                    continue
+
                 log.info(f"  [{q}p] Downloading...")
 
-                fallbacks = [  # lower renditions, best first — used only on short segments
-                    (fq, playlists[fq]) for fq in QUALITIES
-                    if fq in playlists and int(fq) < int(q)
+                # Every lower rendition the manifest offers, best first — not
+                # just the ones in QUALITIES, so narrowing QUALITIES to a single
+                # quality does not also remove the recovery path.
+                fallbacks = [
+                    (fq, playlists[fq])
+                    for fq in sorted(playlists, key=int, reverse=True)
+                    if int(fq) < int(q)
                 ]
                 dl_ok = download_video(playlists[q], out_path, fallbacks=fallbacks)
                 if not dl_ok:
