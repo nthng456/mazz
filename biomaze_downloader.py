@@ -165,7 +165,7 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
                     break
                 page.wait_for_timeout(250)
 
-            key_b64 = next((d["keyB64"] for d in cap["decrypts"]
+            key_b64 = next((d["keyB64"] for d in (cap or {}).get("decrypts", [])
                             if d.get("isM3u8") and d.get("keyB64")), None)
             if not key_b64:
                 log.warning(f"No manifest key captured for {video_url}")
@@ -175,7 +175,7 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
             key = base64.b64decode(key_b64)
 
             master = None
-            for r in cap["raw"]:
+            for r in (cap or {}).get("raw", []):
                 text = decrypt_manifest(r["full"], key)
                 if text and "#EXT-X-STREAM-INF" in text:
                     master = text
