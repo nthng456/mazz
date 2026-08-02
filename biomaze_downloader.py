@@ -140,18 +140,30 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
             page.add_init_script(INIT_SCRIPT)
 
             page.goto(video_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
 
+            # Click as soon as a play target exists rather than after a fixed
+            # pause: the player usually mounts well under a second.
             for selector in [".media", "video", "[class*='play']"]:
                 try:
-                    page.click(selector, timeout=3000)
+                    page.click(selector, timeout=2500)
                     break
                 except Exception:
                     continue
 
-            page.wait_for_timeout(9000)
-
-            cap = page.evaluate("() => window.__C")
+            # Poll for what is actually needed — the manifest key and at least
+            # one master playlist — instead of waiting out the worst case. The
+            # player typically has both within a couple of seconds, so this
+            # returns as soon as they land and only reaches the ceiling when
+            # something is genuinely slow.
+            deadline = time.time() + 20
+            cap = None
+            while time.time() < deadline:
+                cap = page.evaluate("() => window.__C")
+                have_key = any(d.get("isM3u8") and d.get("keyB64")
+                               for d in cap["decrypts"])
+                if have_key and cap["raw"]:
+                    break
+                page.wait_for_timeout(250)
 
             key_b64 = next((d["keyB64"] for d in cap["decrypts"]
                             if d.get("isM3u8") and d.get("keyB64")), None)
