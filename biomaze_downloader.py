@@ -44,14 +44,19 @@ HEADERS = {
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler("downloader.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger("biomaze")
+
+# huggingface_hub logs every HTTP call at INFO, which would bury the run's own
+# output; same for urllib3's connection-pool chatter.
+for noisy in ("httpx", "urllib3", "huggingface_hub", "filelock"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 session = requests.Session()
 session.headers.update(HEADERS)
@@ -125,7 +130,6 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
     if not video_url.endswith("/iframe"):
         video_url = video_url.rstrip("/") + "/iframe"
 
-    log.info(f"Extracting m3u8 from: {video_url}")
     t0 = time.time()
 
     try:
@@ -157,7 +161,6 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
                 return None
 
             key = base64.b64decode(key_b64)
-            log.info(f"Session manifest key captured ({len(key)} bytes)")
 
             master = None
             for r in cap["raw"]:
@@ -181,8 +184,6 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
                     q = name.group(1) if name else (res.group(1) if res else None)
                     if q and i + 1 < len(lines):
                         variants[q] = lines[i + 1].strip()
-
-            log.info(f"Master declares qualities: {sorted(variants, key=int, reverse=True)}")
 
             # Fetch every rendition the master offers, not only the ones in
             # QUALITIES: the lower ones are the recovery path for segments the
@@ -209,6 +210,7 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
             browser.close()
 
             result = {}
+            summary = []
             for q, u in sorted(wanted.items(), key=lambda kv: int(kv[0]), reverse=True):
                 raw = fetched.get(u) or ""
                 if not raw:
@@ -219,14 +221,13 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
                     log.warning(f"  [{q}p] decrypt failed ({len(raw)} raw chars)")
                     continue
 
-                segs = text.count("#EXTINF")
-                dur = sum(float(x) for x in re.findall(r"#EXTINF:([\d.]+)", text))
-                size = sum(int(a) for a, _ in re.findall(r"#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?", text))
                 if "#EXT-X-ENDLIST" not in text:
                     log.warning(f"  [{q}p] playlist has no #EXT-X-ENDLIST — may be truncated")
 
                 result[q] = text
-                log.info(f"  [{q}p] {segs} segments, {dur:.0f}s, {size / 1048576:.0f} MB")
+                size = sum(int(a) for a, _ in
+                           re.findall(r"#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?", text))
+                summary.append(f"{q}p:{size / 1048576:.0f}MB")
 
             # Distinct playlists are the guard against silently mapping the
             # same variant to several quality labels.
@@ -234,8 +235,12 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
                 log.error("  Duplicate playlists across qualities — aborting")
                 return None
 
-            elapsed = time.time() - t0
-            log.info(f"Extraction done in {elapsed:.1f}s — got: {list(result.keys())}")
+            if result:
+                top = max(result, key=int)
+                segs = result[top].count("#EXTINF")
+                dur = sum(float(x) for x in re.findall(r"#EXTINF:([\d.]+)", result[top]))
+                log.info(f"  {segs} segments, {dur / 60:.0f}min — "
+                         f"{' '.join(summary)} ({time.time() - t0:.0f}s)")
             return result if result else None
 
     except Exception as e:
@@ -386,7 +391,6 @@ def fetch_key(key_url: str, key_cache: dict) -> bytes:
             kr = session.get(key_url, headers=HEADERS, timeout=15)
             kr.raise_for_status()
             key_cache[key_url] = kr.content
-            log.info(f"  Encryption key fetched ({len(kr.content)} bytes)")
         return key_cache[key_url]
 
 
@@ -438,7 +442,6 @@ def verify_output(path: str, expected_duration: float, dropped: int) -> bool:
         return False
 
     if expected_duration <= 0:
-        log.info(f"  Verified: {actual:.0f}s, streams={sorted(kinds)}")
         return True
 
     drift = abs(actual - expected_duration)
@@ -449,8 +452,6 @@ def verify_output(path: str, expected_duration: float, dropped: int) -> bool:
                   + (f", {dropped} segment(s) were dropped" if dropped else ""))
         return False
 
-    log.info(f"  Verified: {actual:.0f}s vs {expected_duration:.0f}s expected "
-             f"({pct:.1f}% drift), streams={sorted(kinds)}")
     return True
 
 
@@ -471,7 +472,7 @@ def build_fallback_chain(target: str, playlists: dict) -> list[tuple[str, str]]:
     return [(q, playlists[q]) for q in higher + lower]
 
 
-def download_video(m3u8_content: str, output_path: str,
+def download_video(m3u8_content: str, output_path: str, label: str = "video",
                    fallbacks: list[tuple[str, str]] | None = None) -> bool:
     """
     Assemble one rendition into a .ts, then remux to MP4.
@@ -488,10 +489,9 @@ def download_video(m3u8_content: str, output_path: str,
     t0 = time.time()
     segments = parse_segments(m3u8_content)
     total = len(segments)
-    log.info(f"  Downloading {total} segments...")
 
     if total == 0:
-        log.error("  No segments found in playlist")
+        log.error(f"  [{label}] no segments in playlist")
         return False
 
     # Parse fallback playlists lazily — most videos never touch them.
@@ -514,21 +514,18 @@ def download_video(m3u8_content: str, output_path: str,
         fetch_key(segments[0]["key_url"], key_cache)
 
     def get(i):
-        """Resolve segment i, falling back down the renditions if truncated."""
+        """Resolve segment i, falling back across renditions if truncated."""
         data = fetch_decrypted(segments[i], i, key_cache)
         if data is not None:
             return i, data, None
 
         for alt_q, alt_segs in alts:
-            log.info(f"    Segment {i}: trying {alt_q}p instead")
             data = fetch_decrypted(alt_segs[i], i, key_cache)
             if data is not None:
-                log.info(f"    Segment {i}: recovered from {alt_q}p ({len(data)}B)")
                 return i, data, alt_q
         return i, None, None
 
     with open(output_path + ".ts", "wb") as out:
-        last_pct = -1
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             # map keeps results in submission order, so the .ts stays correctly
             # ordered while up to WORKERS requests are in flight. It also bounds
@@ -538,39 +535,26 @@ def download_video(m3u8_content: str, output_path: str,
                     # Dropping 4 s keeps the rest of the video usable; the gap
                     # is reported so the objects can be purged upstream.
                     missing.append(i)
-                    want = segments[i]["byterange"][0] if segments[i]["byterange"] else "?"
-                    log.error(f"    Segment {i}: unavailable in every rendition — "
-                              f"skipping {want}B")
                     continue
 
                 if from_q:
                     substituted.append((i, from_q))
                 out.write(data)
 
-                pct = int((i + 1) / total * 100)
-                if pct >= last_pct + 5:
-                    elapsed = time.time() - t0
-                    mb = out.tell() / (1024 * 1024)
-                    rate = mb / elapsed if elapsed else 0
-                    log.info(f"  Progress: {pct}% ({i+1}/{total}) — "
-                             f"{mb:.1f} MB in {elapsed:.0f}s ({rate:.1f} MB/s)")
-                    last_pct = pct
-
     if substituted:
         by_q = {}
         for idx, q in substituted:
             by_q.setdefault(q, []).append(idx)
         detail = ", ".join(f"{len(v)} from {k}p" for k, v in by_q.items())
-        log.warning(f"  {len(substituted)} segment(s) substituted ({detail})")
+        log.warning(f"  [{label}] {len(substituted)} segment(s) substituted ({detail})")
 
     if missing:
-        log.error(f"  {len(missing)} segment(s) lost entirely: {missing[:20]}"
+        log.error(f"  [{label}] {len(missing)} segment(s) lost entirely: {missing[:20]}"
                   f"{' ...' if len(missing) > 20 else ''}")
         record_missing(output_path, missing, substituted)
 
     # Remux TS → MP4 with ffmpeg
     ts_path = output_path + ".ts"
-    log.info(f"  Remuxing TS → MP4...")
     cmd = [
         "ffmpeg", "-y",
         "-i", ts_path,
@@ -584,7 +568,6 @@ def download_video(m3u8_content: str, output_path: str,
 
     if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        elapsed = time.time() - t0
 
         # The playlist states the duration outright, so compare against it: a
         # file short by whole segments is the failure this catches.
@@ -593,11 +576,11 @@ def download_video(m3u8_content: str, output_path: str,
             os.remove(output_path)
             return False
 
-        log.info(f"  Done: {size_mb:.1f} MB in {elapsed:.0f}s")
+        log.info(f"  [{label}] 100% — {size_mb:.0f} MB in {time.time() - t0:.0f}s")
         return True
     else:
         stderr = result.stderr[-300:] if result.stderr else "no stderr"
-        log.error(f"  Remux failed: {stderr}")
+        log.error(f"  [{label}] remux failed: {stderr}")
         if os.path.exists(output_path):
             os.remove(output_path)
         return False
@@ -618,8 +601,6 @@ def bucket_inventory(folder_name: str, filenames: list[str]) -> set[str]:
     if not paths:
         return set()
 
-    log.info(f"Checking the bucket for {len(paths)} file(s)...")
-    t0 = time.time()
     try:
         info = list(get_bucket_paths_info(HF_BUCKET_ID, paths))
     except Exception as e:
@@ -639,9 +620,8 @@ def bucket_inventory(folder_name: str, filenames: list[str]) -> set[str]:
             continue
         present.add(path[len(prefix):] if path.startswith(prefix) else path)
 
-    log.info(f"  {len(present)} of {len(paths)} already uploaded "
-             f"({time.time() - t0:.1f}s)"
-             + (f", {partial} incomplete and will be redone" if partial else ""))
+    log.info(f"  {len(present)}/{len(paths)} already on HF"
+             + (f", {partial} incomplete will be redone" if partial else ""))
     return present
 
 
@@ -655,7 +635,7 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
     staged alone in a temp dir to avoid re-uploading siblings.
     """
     hf_dest_dir = f"{HF_BUCKET}/{folder_name}/{quality}"
-    log.info(f"  Uploading: {filename} → {hf_dest_dir}/")
+    log.info(f"  Uploading to HF...")
     t0 = time.time()
 
     staging = None
@@ -674,7 +654,7 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
         if not uploaded:
             skipped = [op for op in plan.operations if op.action == "skip"]
             if skipped:
-                log.info(f"  Upload skipped (already present) in {elapsed:.1f}s")
+                log.info(f"  Already present — upload skipped ({elapsed:.0f}s)")
                 return True
             log.error(f"  Upload produced no operations — nothing was sent")
             return False
@@ -693,8 +673,8 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
                 log.error(f"  Upload size mismatch: remote {remote_info[0].size}B vs "
                           f"local {local_size}B")
                 return False
-            log.info(f"  Upload OK in {elapsed:.1f}s "
-                     f"({remote_info[0].size / 1048576:.1f} MB verified)")
+            log.info(f"  Uploaded in {elapsed:.0f}s "
+                     f"({remote_info[0].size / 1048576:.0f} MB verified)")
             return True
         except Exception as e:
             log.error(f"  Upload verification failed for {remote}: "
@@ -702,7 +682,7 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
             return False
 
     except Exception as e:
-        log.error(f"  Upload FAILED in {time.time() - t0:.1f}s — {type(e).__name__}: {e}")
+        log.error(f"  Upload FAILED in {time.time() - t0:.0f}s — {type(e).__name__}: {e}")
         return False
     finally:
         if staging and os.path.isdir(staging):
@@ -710,12 +690,6 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
 
 
 def process_json(json_path: str, output_base: str = "./data"):
-    log.info(f"{'='*60}")
-    log.info(f"Processing: {json_path}")
-    log.info(f"Output base: {output_base}")
-    log.info(f"HF Bucket: {HF_BUCKET}")
-    log.info(f"{'='*60}")
-
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -723,14 +697,13 @@ def process_json(json_path: str, output_base: str = "./data"):
     files = data["files"]
 
     folder_path = os.path.join(output_base, folder_name)
-
     for q in QUALITIES:
-        qpath = os.path.join(folder_path, q)
-        os.makedirs(qpath, exist_ok=True)
-        log.info(f"Directory ready: {qpath}")
+        os.makedirs(os.path.join(folder_path, q), exist_ok=True)
 
     total_links = sum(len(f["links"]) for f in files)
-    log.info(f"Total items: {len(files)} sessions, {total_links} video parts")
+    t0 = time.time()
+    log.info(f"=== {os.path.basename(json_path)} — {len(files)} sessions, "
+             f"{total_links} videos → {folder_name} ===")
 
     # Flatten to (filename, url) first so the bucket can be queried in one call.
     jobs = []
@@ -757,68 +730,54 @@ def process_json(json_path: str, output_base: str = "./data"):
         todo = [q for q in QUALITIES if f"{q}/{filename}" not in present]
         if not todo:
             skipped += 1
-            log.info(f"[{done}/{total_links}] ✓ {filename} — already on HF, skipping")
+            log.info(f"[{done}/{total_links}] ✓ {filename} — already on HF")
             continue
 
-        log.info(f"")
-        log.info(f"[{done}/{total_links}] ▶ {filename}  (need: {', '.join(todo)})")
-        log.info(f"  URL: {link}")
+        log.info(f"[{done}/{total_links}] ▶ {filename} "
+                 f"(need: {', '.join(todo)})")
 
         playlists = extract_m3u8_per_quality(link)
         if not playlists:
-            log.error(f"  SKIP — m3u8 extraction failed")
             failed += 1
+            log.error(f"  extraction failed: {link}")
             continue
-
-        log.info(f"  Extracted qualities: {list(playlists.keys())}")
 
         all_ok = True
 
         for q in todo:
             if q not in playlists:
-                log.warning(f"  [{q}p] Not available")
+                all_ok = False
+                log.warning(f"  [{q}p] not offered by the master playlist")
                 continue
 
             out_path = os.path.join(folder_path, q, filename)
-
-            log.info(f"  [{q}p] Downloading...")
 
             # Higher renditions first, then lower ones down to FALLBACK_FLOOR.
             # Built from every rendition the manifest offers, not just those in
             # QUALITIES, so narrowing QUALITIES does not remove the recovery path.
             fallbacks = build_fallback_chain(q, playlists)
-            if fallbacks:
-                log.info(f"  [{q}p] Fallback order: "
-                         f"{' -> '.join(fq for fq, _ in fallbacks)}")
-            dl_ok = download_video(playlists[q], out_path, fallbacks=fallbacks)
+            dl_ok = download_video(playlists[q], out_path, label=f"{q}p",
+                                   fallbacks=fallbacks)
             if not dl_ok:
                 all_ok = False
-                log.error(f"  [{q}p] Download failed!")
+                log.error(f"  [{q}p] download failed")
                 continue
 
             up_ok = upload_file_to_hf(out_path, folder_name, q, filename)
 
             if up_ok:
                 os.remove(out_path)
-                log.info(f"  [{q}p] Local file deleted after upload")
             else:
                 all_ok = False
-                log.error(f"  [{q}p] Upload failed — keeping local file")
+                log.error(f"  [{q}p] upload failed — keeping local file")
 
         if all_ok:
             success += 1
         else:
             failed += 1
 
-        log.info(f"  Progress: {done}/{total_links} | ok: {success} | "
-                 f"failed: {failed} | skipped: {skipped}")
-
-    log.info(f"")
-    log.info(f"{'='*60}")
-    log.info(f"FINISHED: {json_path}")
-    log.info(f"  Total: {total_links} | Success: {success} | "
-             f"Failed: {failed} | Already present: {skipped}")
-    log.info(f"{'='*60}")
+    log.info(f"=== DONE — ok {success}, failed {failed}, skipped {skipped} "
+             f"in {(time.time() - t0) / 60:.0f} min ===")
 
 
 if __name__ == "__main__":
