@@ -122,10 +122,12 @@ def decrypt_manifest(raw_hex: str, key: bytes) -> str | None:
     return None
 
 
-def extract_m3u8_per_quality(video_url: str) -> dict | None:
+def _extract_m3u8_uncapped(video_url: str) -> dict | None:
     """
     Returns {quality: playlist_text}, mapped explicitly from the master
     playlist's NAME= attribute — never guessed from segment sizes.
+
+    Runs unbounded; call extract_m3u8_per_quality instead, which caps it.
     """
     if not video_url.endswith("/iframe"):
         video_url = video_url.rstrip("/") + "/iframe"
@@ -218,15 +220,20 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
 
             # Fetch from inside the page: the endpoint returns an empty body
             # unless the request carries a Referer/Origin for the site.
+            #
+            # Every fetch carries its own AbortSignal. Without one, a server
+            # that accepts the connection and then never answers leaves the
+            # promise pending forever — and page.evaluate has no timeout of its
+            # own, so the whole run hangs on that single await.
             fetched = page.evaluate("""async (urls) => {
-                const out = {};
-                for (const u of urls) {
+                const one = async (u) => {
                     try {
-                        const r = await fetch(u);
-                        out[u] = await r.text();
-                    } catch (e) { out[u] = ''; }
-                }
-                return out;
+                        const r = await fetch(u, { signal: AbortSignal.timeout(20000) });
+                        return await r.text();
+                    } catch (e) { return ''; }
+                };
+                const texts = await Promise.all(urls.map(one));
+                return Object.fromEntries(urls.map((u, i) => [u, texts[i]]));
             }""", list(wanted.values()))
 
             browser.close()
@@ -268,6 +275,50 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
     except Exception as e:
         log.error(f"Extraction failed for {video_url}: {e}", exc_info=True)
         return None
+
+
+def extract_m3u8_per_quality(video_url: str) -> dict | None:
+    """
+    Cap extraction with a hard deadline.
+
+    Inside the page every await is individually bounded (navigation, fetch
+    signals), but a player wedged on its main thread can still swallow an
+    evaluate and hold the run forever. Playwright's sync API refuses to run in
+    a thread with a live event loop, so the deadline is enforced by running the
+    uncapped body in a fork and killing it past the limit. The body must be
+    importable (guarded by __main__) and only touch pipe-safe objects, both of
+    which hold here.
+    """
+    if sys.platform == "win32":
+        # fork() does not exist on Windows. The body is bounded per-await
+        # already, so the worst case is the sum of the per-step ceilings —
+        # bounded in practice, if not by a single watchdog.
+        return _extract_m3u8_uncapped(video_url)
+
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            res = _extract_m3u8_uncapped(video_url)
+            os.write(w, json.dumps(res).encode("utf-8"))
+            os._exit(0)
+        except Exception:
+            os._exit(1)
+
+    os.close(w)
+    with os.fdopen(r, "rb") as rf:
+        if mp.freeze_support():  # no-op; keeps mp referenced on Windows
+            pass
+        payload = rf.read()
+        if not payload:
+            log.warning(f"Extraction hit the {EXTRACT_CEILING}s ceiling for {video_url}")
+            return None
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except Exception:
+            log.warning(f"Extraction returned invalid JSON for {video_url}")
+            return None
 
 
 def parse_segments(m3u8_content: str):
@@ -492,6 +543,39 @@ def build_fallback_chain(target: str, playlists: dict) -> list[tuple[str, str]]:
     lower = sorted((q for q in playlists if FALLBACK_FLOOR <= int(q) < t),
                    key=int, reverse=True)
     return [(q, playlists[q]) for q in higher + lower]
+
+
+def progress_bar(done: int, total: int, mb: float, elapsed: float,
+                 label: str) -> None:
+    """
+    Redraw a single-line progress bar in place.
+
+    Writes straight to stderr rather than through the logger: the log file
+    would otherwise fill with thousands of half-finished lines, and stderr
+    keeps the bar off stdout where the real log lines go. Skipped entirely
+    when stderr is not a terminal, so redirected output stays clean.
+    """
+    if not sys.stderr.isatty():
+        return
+
+    frac = done / total if total else 0
+    width = 24
+    filled = int(width * frac)
+    bar = "█" * filled + "░" * (width - filled)
+    rate = mb / elapsed if elapsed else 0
+    eta = (total - done) / (done / elapsed) if done and elapsed else 0
+    sys.stderr.write(
+        f"\r  [{label}] {bar} {frac * 100:3.0f}%  "
+        f"{mb:6.0f} MB  {rate:4.0f} MB/s  ETA {eta:3.0f}s "
+    )
+    sys.stderr.flush()
+
+
+def clear_progress_bar() -> None:
+    """Wipe the bar so the next log line starts on a clean row."""
+    if sys.stderr.isatty():
+        sys.stderr.write("\r" + " " * 78 + "\r")
+        sys.stderr.flush()
 
 
 def download_video(m3u8_content: str, output_path: str, label: str = "video",
