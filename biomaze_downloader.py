@@ -581,32 +581,46 @@ def download_video(m3u8_content: str, output_path: str,
         return False
 
 
-def already_on_hf(folder_name: str, quality: str, filename: str) -> bool:
+def bucket_inventory(folder_name: str, filenames: list[str]) -> set[str]:
     """
-    True if this file is already in the bucket, so the download can be skipped.
+    Ask the bucket once which of these files it already holds.
 
-    Failures here return False: a network blip should cost a re-download, not
-    silently mark a video as done when nothing was ever uploaded.
+    get_bucket_paths_info accepts many paths per call, so the whole run's
+    inventory costs one request instead of one per file. Returns the set of
+    "quality/filename" keys present and complete.
+
+    On failure this returns an empty set: nothing is skipped, so a bad lookup
+    costs re-downloads rather than silently marking videos as done.
     """
-    remote = f"{folder_name}/{quality}/{filename}"
+    paths = [f"{folder_name}/{q}/{fn}" for q in QUALITIES for fn in filenames]
+    if not paths:
+        return set()
+
+    log.info(f"Checking the bucket for {len(paths)} file(s)...")
+    t0 = time.time()
     try:
-        info = list(get_bucket_paths_info(HF_BUCKET_ID, [remote]))
+        info = list(get_bucket_paths_info(HF_BUCKET_ID, paths))
     except Exception as e:
-        log.warning(f"  [{quality}p] Could not check the bucket "
-                    f"({type(e).__name__}: {e}) — downloading anyway")
-        return False
+        log.warning(f"  Bucket inventory failed ({type(e).__name__}: {e}) — "
+                    f"nothing will be skipped")
+        return set()
 
-    if not info:
-        return False
+    prefix = f"{folder_name}/"
+    present, partial = set(), 0
+    for entry in info:
+        path = getattr(entry, "path", None)
+        if not path:
+            continue
+        # Objects at or under 1 KB are leftovers from an interrupted upload.
+        if (getattr(entry, "size", 0) or 0) <= 1024:
+            partial += 1
+            continue
+        present.add(path[len(prefix):] if path.startswith(prefix) else path)
 
-    size = getattr(info[0], "size", 0) or 0
-    if size <= 1024:
-        log.warning(f"  [{quality}p] {remote} exists but is only {size}B "
-                    f"— treating as incomplete, re-downloading")
-        return False
-
-    log.info(f"  [{quality}p] Already on HF ({size / 1048576:.1f} MB) — skipping")
-    return True
+    log.info(f"  {len(present)} of {len(paths)} already uploaded "
+             f"({time.time() - t0:.1f}s)"
+             + (f", {partial} incomplete and will be redone" if partial else ""))
+    return present
 
 
 def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename: str) -> bool:
@@ -696,82 +710,93 @@ def process_json(json_path: str, output_base: str = "./data"):
     total_links = sum(len(f["links"]) for f in files)
     log.info(f"Total items: {len(files)} sessions, {total_links} video parts")
 
-    done = 0
-    success = 0
-    failed = 0
-
+    # Flatten to (filename, url) first so the bucket can be queried in one call.
+    jobs = []
     for item in files:
         order = item["order"]
         links = item["links"]
-
         for part_idx, link in enumerate(links, start=1):
-            done += 1
+            name = f"{order}.mp4" if len(links) == 1 else f"{order}-{part_idx}.mp4"
+            jobs.append((name, link))
 
-            if len(links) == 1:
-                filename = f"{order}.mp4"
-            else:
-                filename = f"{order}-{part_idx}.mp4"
+    present = bucket_inventory(folder_name, [name for name, _ in jobs])
 
-            log.info(f"")
-            log.info(f"[{done}/{total_links}] ▶ {filename}")
-            log.info(f"  URL: {link}")
+    done = 0
+    success = 0
+    failed = 0
+    skipped = 0
 
-            playlists = extract_m3u8_per_quality(link)
-            if not playlists:
-                log.error(f"  SKIP — m3u8 extraction failed")
-                failed += 1
+    for filename, link in jobs:
+        done += 1
+
+        # Decide what is left BEFORE launching a browser: extraction costs
+        # ~25 s per video, so checking first turns a fully-uploaded run from
+        # an hour of browser startups into a few seconds.
+        todo = [q for q in QUALITIES if f"{q}/{filename}" not in present]
+        if not todo:
+            skipped += 1
+            log.info(f"[{done}/{total_links}] ✓ {filename} — already on HF, skipping")
+            continue
+
+        log.info(f"")
+        log.info(f"[{done}/{total_links}] ▶ {filename}  (need: {', '.join(todo)})")
+        log.info(f"  URL: {link}")
+
+        playlists = extract_m3u8_per_quality(link)
+        if not playlists:
+            log.error(f"  SKIP — m3u8 extraction failed")
+            failed += 1
+            continue
+
+        log.info(f"  Extracted qualities: {list(playlists.keys())}")
+
+        all_ok = True
+
+        for q in todo:
+            if q not in playlists:
+                log.warning(f"  [{q}p] Not available")
                 continue
 
-            log.info(f"  Extracted qualities: {list(playlists.keys())}")
+            out_path = os.path.join(folder_path, q, filename)
 
-            all_ok = True
+            log.info(f"  [{q}p] Downloading...")
 
-            for q in QUALITIES:
-                if q not in playlists:
-                    log.warning(f"  [{q}p] Not available")
-                    continue
+            # Every lower rendition the manifest offers, best first — not
+            # just the ones in QUALITIES, so narrowing QUALITIES to a single
+            # quality does not also remove the recovery path.
+            fallbacks = [
+                (fq, playlists[fq])
+                for fq in sorted(playlists, key=int, reverse=True)
+                if int(fq) < int(q)
+            ]
+            dl_ok = download_video(playlists[q], out_path, fallbacks=fallbacks)
+            if not dl_ok:
+                all_ok = False
+                log.error(f"  [{q}p] Download failed!")
+                continue
 
-                out_path = os.path.join(folder_path, q, filename)
+            up_ok = upload_file_to_hf(out_path, folder_name, q, filename)
 
-                if already_on_hf(folder_name, q, filename):
-                    continue
-
-                log.info(f"  [{q}p] Downloading...")
-
-                # Every lower rendition the manifest offers, best first — not
-                # just the ones in QUALITIES, so narrowing QUALITIES to a single
-                # quality does not also remove the recovery path.
-                fallbacks = [
-                    (fq, playlists[fq])
-                    for fq in sorted(playlists, key=int, reverse=True)
-                    if int(fq) < int(q)
-                ]
-                dl_ok = download_video(playlists[q], out_path, fallbacks=fallbacks)
-                if not dl_ok:
-                    all_ok = False
-                    log.error(f"  [{q}p] Download failed!")
-                    continue
-
-                up_ok = upload_file_to_hf(out_path, folder_name, q, filename)
-
-                if up_ok:
-                    os.remove(out_path)
-                    log.info(f"  [{q}p] Local file deleted after upload")
-                else:
-                    all_ok = False
-                    log.error(f"  [{q}p] Upload failed — keeping local file")
-
-            if all_ok:
-                success += 1
+            if up_ok:
+                os.remove(out_path)
+                log.info(f"  [{q}p] Local file deleted after upload")
             else:
-                failed += 1
+                all_ok = False
+                log.error(f"  [{q}p] Upload failed — keeping local file")
 
-            log.info(f"  Progress: {done}/{total_links} | ok: {success} | failed: {failed}")
+        if all_ok:
+            success += 1
+        else:
+            failed += 1
+
+        log.info(f"  Progress: {done}/{total_links} | ok: {success} | "
+                 f"failed: {failed} | skipped: {skipped}")
 
     log.info(f"")
     log.info(f"{'='*60}")
     log.info(f"FINISHED: {json_path}")
-    log.info(f"  Total: {total_links} | Success: {success} | Failed: {failed}")
+    log.info(f"  Total: {total_links} | Success: {success} | "
+             f"Failed: {failed} | Already present: {skipped}")
     log.info(f"{'='*60}")
 
 
