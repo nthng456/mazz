@@ -24,8 +24,19 @@ pip install --quiet \
     "playwright>=1.61.0" \
     "requests>=2.31.0" \
     "pycryptodome>=3.20.0" \
-    "huggingface_hub>=1.26.0"
-echo "  ✓ playwright, requests, pycryptodome, huggingface_hub installed"
+    "huggingface_hub>=1.26.0" \
+    "hydrogram>=0.2.0"
+echo "  ✓ playwright, requests, pycryptodome, huggingface_hub, hydrogram installed"
+
+# TgCrypto is a C extension that Hydrogram picks up automatically when present
+# and does the MTProto AES in native code instead of pure Python. It is an
+# optimisation, not a requirement, and it has no wheels for the newest Python
+# releases — so a failed build downgrades to a warning rather than killing setup.
+if pip install --quiet "tgcrypto>=1.2.5" 2>/dev/null; then
+    echo "  ✓ tgcrypto installed (native MTProto crypto)"
+else
+    echo "  ⚠  tgcrypto unavailable for this Python — Hydrogram falls back to pure Python (slower)"
+fi
 
 python - <<'PY'
 import sys
@@ -65,5 +76,11 @@ fi
 echo ""
 echo "========================================"
 echo " Setup complete!"
+echo ""
+echo " Telegram session (once, interactive):"
+echo "   export TG_API_ID=1234567"
+echo "   export TG_API_HASH=0123456789abcdef0123456789abcdef"
+echo "   python make_session.py"
+echo ""
 echo " Run:  python biomaze_downloader.py input.json ./data"
 echo "========================================"
