@@ -24,6 +24,15 @@ import shutil
 import tempfile
 import time
 
+# Rich-based live dashboard. Optional: if rich (or a TTY) is unavailable the
+# downloader falls back to plain line logging and the old stderr progress bar.
+try:
+    import dashboard as dash
+    _HAS_DASH = True
+except Exception:
+    dash = None
+    _HAS_DASH = False
+
 REFERER = "https://stream.biomaze.ir"
 QUALITIES = ["720"]
 HF_BUCKET = "hf://buckets/nthng454/Bucket"
@@ -69,6 +78,21 @@ log = logging.getLogger("biomaze")
 # output; same for urllib3's connection-pool chatter.
 for noisy in ("httpx", "urllib3", "huggingface_hub", "filelock"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def _attach_dashboard_logging(dashboard) -> None:
+    """
+    Replace the stdout StreamHandler with the dashboard's log handler so every
+    log line flows into the scrolling region of the live UI instead of racing
+    with Rich's own terminal writes.  The file handler is kept.
+    """
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if isinstance(h, logging.StreamHandler) and h.stream is sys.stdout:
+            root.removeHandler(h)
+    dh = dash.DashboardLogHandler(dashboard)
+    dh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    root.addHandler(dh)
 
 session = requests.Session()
 session.headers.update(HEADERS)
@@ -598,7 +622,8 @@ def clear_progress_bar() -> None:
 
 
 def download_video(m3u8_content: str, output_path: str, label: str = "video",
-                   fallbacks: list[tuple[str, str]] | None = None) -> bool:
+                   fallbacks: list[tuple[str, str]] | None = None,
+                   job_num: int = 0, filename: str = "") -> bool:
     """
     Assemble one rendition into a .ts, then remux to MP4.
 
@@ -618,6 +643,10 @@ def download_video(m3u8_content: str, output_path: str, label: str = "video",
     if total == 0:
         log.error(f"  [{label}] no segments in playlist")
         return False
+
+    _d = dash.get() if _HAS_DASH else None
+    if _d and _d.is_active():
+        _d.dl_start(filename or os.path.basename(output_path), job_num, label.rstrip("p"))
 
     # Parse fallback playlists lazily — most videos never touch them.
     alts = []
@@ -671,12 +700,24 @@ def download_video(m3u8_content: str, output_path: str, label: str = "video",
                 # terminal writes; the final state is drawn after the loop.
                 now = time.time()
                 if now - last_draw >= 0.2:
-                    progress_bar(i + 1, total, out.tell() / 1048576,
-                                 now - t0, label)
+                    mb = out.tell() / 1048576
+                    elapsed = now - t0
+                    if _d and _d.is_active():
+                        rate = mb / elapsed if elapsed else 0
+                        eta = (total - (i + 1)) / ((i + 1) / elapsed) if i and elapsed else 0
+                        _d.dl_progress(i + 1, total, mb, rate, eta, elapsed)
+                    else:
+                        progress_bar(i + 1, total, mb, elapsed, label)
                     last_draw = now
 
-        progress_bar(total, total, out.tell() / 1048576, time.time() - t0, label)
-    clear_progress_bar()
+        if _d and _d.is_active():
+            el = time.time() - t0
+            mb = out.tell() / 1048576
+            _d.dl_progress(total, total, mb, mb / el if el else 0, 0, el)
+        else:
+            progress_bar(total, total, out.tell() / 1048576, time.time() - t0, label)
+    if not (_d and _d.is_active()):
+        clear_progress_bar()
 
     if substituted:
         by_q = {}
@@ -772,7 +813,7 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
     staged alone in a temp dir to avoid re-uploading siblings.
     """
     hf_dest_dir = f"{HF_BUCKET}/{folder_name}/{quality}"
-    log.info(f"  Uploading to HF...")
+    log.info(f"  [{quality}p] {filename} — uploading to HF")
     t0 = time.time()
 
     staging = None
@@ -853,11 +894,100 @@ def process_json(json_path: str, output_base: str = "./data"):
 
     present = bucket_inventory(folder_name, [name for name, _ in jobs])
 
-    done = 0
-    success = 0
-    failed = 0
-    skipped = 0
+    # --- Live dashboard (falls back to plain logging when not a TTY) ---
+    board = None
+    if _HAS_DASH:
+        board = dash.init(total_links)
+        board.start()
+        if board.is_active():
+            _attach_dashboard_logging(board)
 
+    # --- Concurrent download + upload infrastructure ---
+    # Unbounded queue: downloads never wait for uploads to catch up.
+    upload_queue = queue.Queue()
+
+    # A display-only mirror of what is waiting in (or moving through) the queue,
+    # so the dashboard can list queued names without draining the real Queue.
+    pending_names: list[str] = []
+    pending_lock = threading.Lock()
+
+    def _push_queue_view():
+        if board and board.is_active():
+            with pending_lock:
+                # Stored as "filename|quality" for exact removal; show just the
+                # filename in the queue list.
+                board.set_queue([t.split("|", 1)[0] for t in pending_names])
+
+    # Per-video accounting kept correct despite async uploads. A video is only
+    # tallied once, after every rendition it spawned has finished uploading, so
+    # a single video can never land in both "ok" and "failed".
+    results = {"success": 0, "failed": 0, "skipped": 0}
+    results_lock = threading.Lock()
+    video_states = {}       # filename -> {ok, pending, download_done, finalized}
+    vs_lock = threading.Lock()
+
+    def maybe_finalize(filename):
+        """Tally a video once its downloads are done and no uploads remain."""
+        with vs_lock:
+            st = video_states.get(filename)
+            if not st or st["finalized"]:
+                return
+            if not (st["download_done"] and st["pending"] == 0):
+                return
+            st["finalized"] = True
+            ok = st["ok"]
+        with results_lock:
+            results["success" if ok else "failed"] += 1
+
+    # Upload worker: pulls from queue and uploads until the None sentinel.
+    def upload_worker(worker_idx):
+        while True:
+            item = upload_queue.get()
+            if item is None:  # shutdown signal
+                upload_queue.task_done()
+                break
+
+            out_path, fld, quality, filename = item
+            tag = f"{filename}|{quality}"
+            with pending_lock:
+                if tag in pending_names:
+                    pending_names.remove(tag)
+            if board and board.is_active():
+                mb = os.path.getsize(out_path) / 1048576 if os.path.exists(out_path) else 0.0
+                board.up_start(worker_idx, filename, quality, mb, time.monotonic())
+            _push_queue_view()
+
+            try:
+                up_ok = upload_file_to_hf(out_path, fld, quality, filename)
+                if up_ok:
+                    os.remove(out_path)
+                else:
+                    log.error(f"  [{quality}p] upload failed — keeping local file")
+                    with vs_lock:
+                        video_states[filename]["ok"] = False
+            except Exception as e:
+                log.error(f"  [{quality}p] upload exception: {type(e).__name__}: {e}")
+                with vs_lock:
+                    video_states[filename]["ok"] = False
+            finally:
+                if board and board.is_active():
+                    board.up_idle(worker_idx)
+                with vs_lock:
+                    video_states[filename]["pending"] -= 1
+                upload_queue.task_done()
+                maybe_finalize(filename)
+
+    # Two upload workers pull from the queue in parallel.
+    UPLOAD_WORKERS = int(os.environ.get("BIOMAZE_UPLOAD_WORKERS", "2"))
+    upload_threads = []
+    for idx in range(UPLOAD_WORKERS):
+        t = threading.Thread(target=upload_worker, args=(idx,), daemon=True)
+        t.start()
+        upload_threads.append(t)
+
+    done = 0
+
+    # --- Main loop: extract + download, then hand each file to the queue ---
     for filename, link in jobs:
         done += 1
 
@@ -866,25 +996,36 @@ def process_json(json_path: str, output_base: str = "./data"):
         # an hour of browser startups into a few seconds.
         todo = [q for q in QUALITIES if f"{q}/{filename}" not in present]
         if not todo:
-            skipped += 1
+            with results_lock:
+                results["skipped"] += 1
             log.info(f"[{done}/{total_links}] ✓ {filename} — already on HF")
             continue
+
+        with vs_lock:
+            video_states[filename] = {
+                "ok": True, "pending": 0,
+                "download_done": False, "finalized": False,
+            }
 
         log.info(f"[{done}/{total_links}] ▶ {filename} "
                  f"(need: {', '.join(todo)})")
 
+        if board and board.is_active():
+            board.dl_extracting(filename, done)
         playlists = extract_m3u8_per_quality(link)
         if not playlists:
-            failed += 1
             log.error(f"  extraction failed: {link}")
+            with vs_lock:
+                video_states[filename]["ok"] = False
+                video_states[filename]["download_done"] = True
+            maybe_finalize(filename)
             continue
-
-        all_ok = True
 
         for q in todo:
             if q not in playlists:
-                all_ok = False
                 log.warning(f"  [{q}p] not offered by the master playlist")
+                with vs_lock:
+                    video_states[filename]["ok"] = False
                 continue
 
             out_path = os.path.join(folder_path, q, filename)
@@ -894,27 +1035,46 @@ def process_json(json_path: str, output_base: str = "./data"):
             # QUALITIES, so narrowing QUALITIES does not remove the recovery path.
             fallbacks = build_fallback_chain(q, playlists)
             dl_ok = download_video(playlists[q], out_path, label=f"{q}p",
-                                   fallbacks=fallbacks)
+                                   fallbacks=fallbacks, job_num=done,
+                                   filename=filename)
             if not dl_ok:
-                all_ok = False
                 log.error(f"  [{q}p] download failed")
+                with vs_lock:
+                    video_states[filename]["ok"] = False
                 continue
 
-            up_ok = upload_file_to_hf(out_path, folder_name, q, filename)
+            # Download succeeded — hand off to the upload queue and move on to
+            # the next download immediately, without waiting for the upload.
+            with vs_lock:
+                video_states[filename]["pending"] += 1
+            with pending_lock:
+                pending_names.append(f"{filename}|{q}")
+            upload_queue.put((out_path, folder_name, q, filename))
+            _push_queue_view()
 
-            if up_ok:
-                os.remove(out_path)
-            else:
-                all_ok = False
-                log.error(f"  [{q}p] upload failed — keeping local file")
+        # All renditions for this video have been downloaded (or failed); mark
+        # so the worker can finalize once its uploads drain.
+        with vs_lock:
+            video_states[filename]["download_done"] = True
+        maybe_finalize(filename)
+        if board and board.is_active():
+            board.dl_idle()
 
-        if all_ok:
-            success += 1
-        else:
-            failed += 1
+    # --- Wait for all queued uploads to finish, then stop the workers ---
+    if board and board.is_active():
+        board.dl_done_all()
+    log.info("  Download phase complete — waiting for uploads to finish...")
+    upload_queue.join()
+    for _ in range(UPLOAD_WORKERS):
+        upload_queue.put(None)
+    for t in upload_threads:
+        t.join()
 
-    log.info(f"=== DONE — ok {success}, failed {failed}, skipped {skipped} "
-             f"in {(time.time() - t0) / 60:.0f} min ===")
+    log.info(f"=== DONE — ok {results['success']}, failed {results['failed']}, "
+             f"skipped {results['skipped']} in {(time.time() - t0) / 60:.0f} min ===")
+
+    if board:
+        board.stop()
 
 
 if __name__ == "__main__":

@@ -24,8 +24,9 @@ pip install --quiet \
     "playwright>=1.61.0" \
     "requests>=2.31.0" \
     "pycryptodome>=3.20.0" \
-    "huggingface_hub>=1.26.0"
-echo "  ✓ playwright, requests, pycryptodome, huggingface_hub installed"
+    "huggingface_hub>=1.26.0" \
+    "rich>=13.7.0"
+echo "  ✓ playwright, requests, pycryptodome, huggingface_hub, rich installed"
 
 python - <<'PY'
 import sys
