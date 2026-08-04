@@ -897,7 +897,12 @@ def process_json(json_path: str, output_base: str = "./data"):
         order = item["order"]
         links = item["links"]
         for part_idx, link in enumerate(links, start=1):
-            name = f"{order}.mp4" if len(links) == 1 else f"{order}-{part_idx}.mp4"
+            # Zero-pad the session order to 3 digits so the files sort in
+            # session order (001.mp4 < 010.mp4 < 100.mp4) instead of lexically
+            # (1 < 10 < 100 …). The part index stays unpadded — at most a
+            # handful per session.
+            stem = f"{int(order):03d}"
+            name = f"{stem}.mp4" if len(links) == 1 else f"{stem}-{part_idx}.mp4"
             jobs.append((name, link))
 
     present = bucket_inventory(folder_name, [name for name, _ in jobs])

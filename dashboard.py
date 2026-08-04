@@ -2,15 +2,22 @@
 Live terminal dashboard for the Biomaze downloader (Rich).
 
 Layout, top to bottom:
-  - a scrolling log region (recent lines, colourised by level)
+  - log lines scroll as ordinary terminal scrollback (colourised by level)
   - a DOWNLOAD panel  (the one video currently downloading; cleared between)
   - an UPLOAD panel    (both upload workers + the waiting queue)
+
+The two panels are the only things pinned in Rich's Live region; log lines are
+printed through the live console so they scroll ABOVE the panels and are emitted
+exactly once. Keeping the live region to just the panels also keeps it short
+enough to redraw in place — a taller renderable (or a non-overwrite sink) makes
+Rich stack frames instead of updating, which jumbles the output.
 
 Everything is driven from a single lock-guarded state object so the download
 thread, the two upload workers, and Rich's own refresh thread never race.
 
-When stdout is not a TTY (redirected to a file, CI logs) the whole live layer
-is skipped and logging falls back to plain lines — see is_active().
+When stdout is not a real, tall-enough TTY (redirected to a file, CI logs, a
+short window) the whole live layer is skipped and logging falls back to plain
+lines — see _can_render() / is_active().
 
 Upload note: sync_bucket(quiet=True) exposes no byte-level progress callback,
 so the upload panel shows an honest moving pulse + elapsed + file size rather
@@ -19,9 +26,9 @@ bar is a true percentage.
 """
 
 import logging
+import sys
 import threading
 import time
-from collections import deque
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -102,14 +109,13 @@ class Dashboard:
     from any thread; each takes _lock briefly and asks Live to re-render.
     """
 
-    _LOG_LINES = 6      # scrolling log lines shown above the panels
-    _REFRESH_HZ = 8     # Rich Live refresh rate (renders per second)
+    _REFRESH_HZ = 8      # Rich Live refresh rate (renders per second)
+    _MIN_HEIGHT = 14     # below this the panels can't fit → fall back to plain logs
 
     def __init__(self, total: int):
         self._total = total
         self._lock = threading.RLock()
         self._console = Console(highlight=False)
-        self._log_buf = deque(maxlen=self._LOG_LINES)
 
         # Download state (single active video)
         self._dl = {
@@ -134,8 +140,26 @@ class Dashboard:
     # Lifecycle
     # ------------------------------------------------------------------ #
 
+    def _can_render(self) -> bool:
+        """
+        Only drive a Live display on a real, overwrite-capable terminal.
+
+        Rich's own is_terminal can report True for a redirected stream (e.g.
+        when FORCE_COLOR is set), and a renderable taller than the window can't
+        be redrawn in place — both make Live stack frames instead of updating,
+        which is what jumbled the logs. Checking the fd and the height directly
+        keeps those cases on the plain-logging path.
+        """
+        try:
+            if not sys.stdout.isatty():
+                return False
+        except Exception:
+            return False
+        return (self._console.is_terminal
+                and self._console.size.height >= self._MIN_HEIGHT)
+
     def start(self) -> "Dashboard":
-        if self._console.is_terminal:
+        if self._can_render():
             self._live = Live(
                 self._render(),
                 console=self._console,
@@ -169,9 +193,15 @@ class Dashboard:
     # ------------------------------------------------------------------ #
 
     def push_log(self, msg: str, style: str = "white") -> None:
+        # Printed as ordinary scrollback ABOVE the live region, not baked into
+        # the live renderable: Rich keeps the panels pinned and lets these lines
+        # scroll off naturally, so a log line is emitted exactly once instead of
+        # being redrawn on every refresh.
+        if not self._live:
+            return
+        line = self._format_log_line(msg, style)
         with self._lock:
-            self._log_buf.append((msg, style))
-        self._refresh()
+            self._live.console.print(line)
 
     # ------------------------------------------------------------------ #
     # Download setters
@@ -237,21 +267,21 @@ class Dashboard:
     def _render(self) -> Group:
         with self._lock:
             return Group(
-                self._render_log(),
                 self._render_download(),
                 self._render_upload(),
             )
 
-    def _render_log(self) -> Table:
-        t = Table.grid(padding=(0, 1))
-        t.add_column()
-        t.add_column()
-        for msg, style in self._log_buf:
-            if len(msg) >= 8 and msg[2] == ":" and msg[5] == ":":
-                ts, rest = msg[:8], msg[8:].lstrip()
-            else:
-                ts, rest = "", msg
-            t.add_row(Text(ts, style="dim cyan"), Text(rest, style=style))
+    @staticmethod
+    def _format_log_line(msg: str, style: str) -> Text:
+        """Split the 'HH:MM:SS ' prefix so the timestamp stays dim-cyan."""
+        if len(msg) >= 8 and msg[2] == ":" and msg[5] == ":":
+            ts, rest = msg[:8], msg[8:].lstrip()
+        else:
+            ts, rest = "", msg
+        t = Text()
+        if ts:
+            t.append(ts + " ", style="dim cyan")
+        t.append(rest, style=style)
         return t
 
     def _render_download(self) -> Panel:
