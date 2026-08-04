@@ -29,6 +29,7 @@ import logging
 import sys
 import threading
 import time
+from collections import deque
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -110,12 +111,14 @@ class Dashboard:
     """
 
     _REFRESH_HZ = 8      # Rich Live refresh rate (renders per second)
-    _MIN_HEIGHT = 14     # below this the panels can't fit → fall back to plain logs
+    _MIN_HEIGHT = 12     # need room for both panels; below this fall back to plain logs
+    _LOG_TAIL = 5        # most-recent log lines kept for the in-place tail
 
     def __init__(self, total: int):
         self._total = total
         self._lock = threading.RLock()
         self._console = Console(highlight=False)
+        self._log_buf = deque(maxlen=self._LOG_TAIL)
 
         # Download state (single active video)
         self._dl = {
@@ -193,15 +196,15 @@ class Dashboard:
     # ------------------------------------------------------------------ #
 
     def push_log(self, msg: str, style: str = "white") -> None:
-        # Printed as ordinary scrollback ABOVE the live region, not baked into
-        # the live renderable: Rich keeps the panels pinned and lets these lines
-        # scroll off naturally, so a log line is emitted exactly once instead of
-        # being redrawn on every refresh.
-        if not self._live:
-            return
-        line = self._format_log_line(msg, style)
+        # Kept in a bounded tail rendered INSIDE the Live region (below the
+        # panels), never printed as scrollback. On a Codespaces/pty terminal
+        # every scrollback write scrolls the screen and re-pins Live, leaving a
+        # copy of the panels in history — the stacking you saw. Holding the log
+        # in the live renderable means the whole frame redraws in place instead.
+        # Full history still lands in downloader.log via the file handler.
         with self._lock:
-            self._live.console.print(line)
+            self._log_buf.append((msg, style))
+        self._refresh()
 
     # ------------------------------------------------------------------ #
     # Download setters
@@ -266,29 +269,38 @@ class Dashboard:
 
     def _render(self) -> Group:
         with self._lock:
-            return Group(
-                self._render_download(),
-                self._render_upload(),
-            )
+            # Panels first, recent-log tail last. The tail is capped to whatever
+            # vertical room is left after the panels so the whole renderable
+            # never exceeds the window height — an over-tall frame is what Rich
+            # can't redraw in place, and that stacking is the bug being fixed.
+            panels = [self._render_download(), self._render_upload()]
+            budget = self._console.size.height - self._PANEL_ROWS - 1
+            tail = self._render_log_tail(max(0, budget))
+            return Group(*panels, tail) if tail is not None else Group(*panels)
 
-    @staticmethod
-    def _format_log_line(msg: str, style: str) -> Text:
-        """Split the 'HH:MM:SS ' prefix so the timestamp stays dim-cyan."""
-        if len(msg) >= 8 and msg[2] == ":" and msg[5] == ":":
-            ts, rest = msg[:8], msg[8:].lstrip()
-        else:
-            ts, rest = "", msg
-        t = Text()
-        if ts:
-            t.append(ts + " ", style="dim cyan")
-        t.append(rest, style=style)
+    # Fixed rows the two panels occupy (borders + content), used to size the tail.
+    _PANEL_ROWS = 11
+
+    def _render_log_tail(self, max_lines: int) -> Table | None:
+        if max_lines <= 0 or not self._log_buf:
+            return None
+        rows = list(self._log_buf)[-max_lines:]
+        t = Table.grid(padding=(0, 1))
+        t.add_column(style="dim cyan", no_wrap=True)
+        t.add_column(overflow="ellipsis", no_wrap=True)
+        for msg, style in rows:
+            if len(msg) >= 8 and msg[2] == ":" and msg[5] == ":":
+                ts, rest = msg[:8], msg[8:].lstrip()
+            else:
+                ts, rest = "", msg
+            t.add_row(Text(ts), Text(rest, style=style))
         return t
 
     def _render_download(self) -> Panel:
         d = self._dl
         t = Table.grid(padding=(0, 2))
-        t.add_column(style="bold cyan", min_width=12)
-        t.add_column()
+        t.add_column(style="bold cyan", min_width=12, no_wrap=True)
+        t.add_column(no_wrap=True, overflow="ellipsis")
 
         st = d["status"]
         if st == "idle":
@@ -317,8 +329,8 @@ class Dashboard:
 
     def _render_upload(self) -> Panel:
         t = Table.grid(padding=(0, 2))
-        t.add_column(style="bold magenta", min_width=9)
-        t.add_column()
+        t.add_column(style="bold magenta", min_width=9, no_wrap=True)
+        t.add_column(no_wrap=True, overflow="ellipsis")
 
         now = time.monotonic()
         for i, w in enumerate(self._workers):
