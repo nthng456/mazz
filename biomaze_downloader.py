@@ -14,6 +14,7 @@ import subprocess
 import requests
 import threading
 import logging
+import logging.handlers
 import base64
 import queue
 import json
@@ -313,12 +314,36 @@ def _extract_m3u8_uncapped(video_url: str) -> dict | None:
         return None
 
 
-def _extract_into(q, video_url: str) -> None:
-    """Child-process entry point: run the uncapped body, hand back the result."""
+def _extract_into(result_q, log_q, video_url: str) -> None:
+    """
+    Child-process entry point: run the uncapped body, hand back the result.
+
+    The child must not touch the terminal the parent's Live display owns — two
+    processes writing cursor-control codes to one terminal is what shredded the
+    panels. So every log handler is stripped and replaced with a QueueHandler
+    that ships records to the parent over log_q; the parent (single process,
+    Live-safe) replays them on its own handlers. The result goes on result_q.
+    """
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(logging.handlers.QueueHandler(log_q))
+    root.setLevel(logging.INFO)
     try:
-        q.put(_extract_m3u8_uncapped(video_url))
+        result_q.put(_extract_m3u8_uncapped(video_url))
     except Exception:
-        q.put(None)
+        result_q.put(None)
+
+
+def _drain_child_logs(log_q) -> None:
+    """Replay every log record the child has queued on the parent's handlers."""
+    while True:
+        try:
+            record = log_q.get_nowait()
+        except (queue.Empty, EOFError, OSError):
+            return
+        if record is not None:
+            logging.getLogger(record.name).handle(record)
 
 
 def extract_m3u8_per_quality(video_url: str) -> dict | None:
@@ -335,16 +360,31 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
     property of the video: the same URL usually extracts fine moments later.
     """
     for attempt in range(1, EXTRACT_ATTEMPTS + 1):
-        q = mp.Queue()
-        proc = mp.Process(target=_extract_into, args=(q, video_url), daemon=True)
+        result_q = mp.Queue()
+        log_q = mp.Queue()
+        proc = mp.Process(target=_extract_into,
+                          args=(result_q, log_q, video_url), daemon=True)
         proc.start()
 
+        result = None
+        got = False
+        deadline = time.time() + EXTRACT_CEILING
         try:
-            result = q.get(timeout=EXTRACT_CEILING)
-        except queue.Empty:
-            result = None
-            log.warning(f"  extraction stalled past {EXTRACT_CEILING}s "
-                        f"(attempt {attempt}/{EXTRACT_ATTEMPTS})")
+            # Poll for the result while continuously replaying the child's logs,
+            # so extraction progress shows in the parent (and its dashboard/file
+            # handlers) without the child ever writing to the terminal itself.
+            while True:
+                _drain_child_logs(log_q)
+                try:
+                    result = result_q.get(timeout=0.25)
+                    got = True
+                    break
+                except queue.Empty:
+                    pass
+                if time.time() >= deadline:
+                    log.warning(f"  extraction stalled past {EXTRACT_CEILING}s "
+                                f"(attempt {attempt}/{EXTRACT_ATTEMPTS})")
+                    break
         finally:
             # terminate() unconditionally: on the success path the child is
             # already exiting, and on the stall path it owns a wedged browser
@@ -354,9 +394,11 @@ def extract_m3u8_per_quality(video_url: str) -> dict | None:
             if proc.is_alive():
                 proc.kill()
                 proc.join(timeout=5)
-            q.close()
+            _drain_child_logs(log_q)   # flush anything logged just before exit
+            result_q.close()
+            log_q.close()
 
-        if result:
+        if got and result:
             return result
         if attempt < EXTRACT_ATTEMPTS:
             time.sleep(RETRY_BACKOFF * attempt)
