@@ -871,10 +871,18 @@ def process_json(json_path: str, output_base: str = "./data"):
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    # An optional "subject" nests the course under a top-level folder, e.g.
+    # subject "فیزیک" + folder_name "شجاعی - سالیانه جامع 405" →
+    # "فیزیک/شجاعی - سالیانه جامع 405". It is folded into folder_name here so
+    # every downstream path (local dirs, HF bucket, inventory) stays two-level
+    # without further changes. JSONs without a subject keep the flat layout.
     folder_name = data["folder_name"]
+    subject = data.get("subject", "").strip()
+    if subject:
+        folder_name = f"{subject}/{folder_name}"
     files = data["files"]
 
-    folder_path = os.path.join(output_base, folder_name)
+    folder_path = os.path.join(output_base, *folder_name.split("/"))
     for q in QUALITIES:
         os.makedirs(os.path.join(folder_path, q), exist_ok=True)
 
