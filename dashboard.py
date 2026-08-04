@@ -1,16 +1,23 @@
 """
 Live terminal dashboard for the Biomaze downloader (Rich).
 
-Layout, top to bottom:
-  - log lines scroll as ordinary terminal scrollback (colourised by level)
+The live region holds exactly two fixed-height boxes:
   - a DOWNLOAD panel  (the one video currently downloading; cleared between)
   - an UPLOAD panel    (both upload workers + the waiting queue)
 
-The two panels are the only things pinned in Rich's Live region; log lines are
-printed through the live console so they scroll ABOVE the panels and are emitted
-exactly once. Keeping the live region to just the panels also keeps it short
-enough to redraw in place — a taller renderable (or a non-overwrite sink) makes
-Rich stack frames instead of updating, which jumbles the output.
+plus a single sticky line beneath them for the most recent warning/error.
+
+There is deliberately NO scrolling log region. A live renderable that grows
+taller than the window can't be redrawn in place — Rich stacks frames instead
+of updating, which is what left a trail of duplicated boxes in the output.
+Keeping the region to two short boxes of constant height (and cropping any
+overflow) means the frame always redraws in place.
+
+The relevant per-item results that used to scroll past are folded INTO the
+boxes instead: each panel carries a dim "Recent" line set via dl_note()/
+up_note() (last finished download / upload). Routine INFO chatter no longer
+reaches the screen at all — it still lands in downloader.log via the file
+handler. Only WARNING+ surfaces, as the sticky alert line.
 
 Everything is driven from a single lock-guarded state object so the download
 thread, the two upload workers, and Rich's own refresh thread never race.
@@ -29,7 +36,6 @@ import logging
 import sys
 import threading
 import time
-from collections import deque
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -49,17 +55,25 @@ _LEVEL_STYLE = {
 
 
 class DashboardLogHandler(logging.Handler):
-    """Feeds formatted, level-coloured lines into the dashboard's log region."""
+    """
+    Surfaces only WARNING+ records as the dashboard's single sticky alert line.
+
+    Routine INFO chatter is dropped here on purpose — the relevant results are
+    folded into the panels via dl_note()/up_note(), and the full history is
+    still written to downloader.log by the file handler.
+    """
 
     def __init__(self, dashboard):
         super().__init__()
         self.dashboard = dashboard
 
     def emit(self, record):
+        if record.levelno < logging.WARNING:
+            return
         try:
             msg = self.format(record)
-            style = _LEVEL_STYLE.get(record.levelno, "white")
-            self.dashboard.push_log(msg, style)
+            style = _LEVEL_STYLE.get(record.levelno, "yellow")
+            self.dashboard.set_alert(msg, style)
         except Exception:
             self.handleError(record)
 
@@ -112,13 +126,14 @@ class Dashboard:
 
     _REFRESH_HZ = 8      # Rich Live refresh rate (renders per second)
     _MIN_HEIGHT = 12     # need room for both panels; below this fall back to plain logs
-    _LOG_TAIL = 5        # most-recent log lines kept for the in-place tail
 
     def __init__(self, total: int):
         self._total = total
         self._lock = threading.RLock()
         self._console = Console(highlight=False)
-        self._log_buf = deque(maxlen=self._LOG_TAIL)
+
+        # Most recent WARNING+ line, shown sticky beneath the panels ("" = none).
+        self._alert = ("", "")
 
         # Download state (single active video)
         self._dl = {
@@ -126,11 +141,13 @@ class Dashboard:
             "filename": "", "job": 0, "quality": "",
             "done": 0, "total": 0, "mb": 0.0,
             "speed": 0.0, "eta": 0.0, "elapsed": 0.0,
+            "note": "",         # last finished download, shown dim in the panel
         }
 
         # Upload state (two workers) + queue
         self._workers = [self._idle_worker() for _ in range(2)]
         self._queue_names: list[str] = []
+        self._up_note = ""      # last finished upload, shown dim in the panel
 
         self._live: Live | None = None
 
@@ -168,6 +185,7 @@ class Dashboard:
                 console=self._console,
                 refresh_per_second=self._REFRESH_HZ,
                 transient=False,
+                vertical_overflow="crop",
             )
             self._live.start()
         return self
@@ -192,18 +210,16 @@ class Dashboard:
             self._live.update(self._render())
 
     # ------------------------------------------------------------------ #
-    # Log
+    # Alert (single sticky line for the most recent WARNING+)
     # ------------------------------------------------------------------ #
 
-    def push_log(self, msg: str, style: str = "white") -> None:
-        # Kept in a bounded tail rendered INSIDE the Live region (below the
-        # panels), never printed as scrollback. On a Codespaces/pty terminal
-        # every scrollback write scrolls the screen and re-pins Live, leaving a
-        # copy of the panels in history — the stacking you saw. Holding the log
-        # in the live renderable means the whole frame redraws in place instead.
-        # Full history still lands in downloader.log via the file handler.
+    def set_alert(self, msg: str, style: str = "yellow") -> None:
+        # One line, rendered INSIDE the Live region beneath the panels, so it
+        # redraws in place and never scrolls the screen (scrollback is what
+        # re-pinned Live and stacked the panels). Full history still lands in
+        # downloader.log via the file handler.
         with self._lock:
-            self._log_buf.append((msg, style))
+            self._alert = (msg, style)
         self._refresh()
 
     # ------------------------------------------------------------------ #
@@ -240,6 +256,12 @@ class Dashboard:
             self._dl.update(status="done")
         self._refresh()
 
+    def dl_note(self, msg: str) -> None:
+        """Set the dim 'Recent' line in the DOWNLOAD panel (last finished/skipped)."""
+        with self._lock:
+            self._dl["note"] = msg
+        self._refresh()
+
     # ------------------------------------------------------------------ #
     # Upload setters
     # ------------------------------------------------------------------ #
@@ -263,38 +285,26 @@ class Dashboard:
             self._queue_names = list(names)
         self._refresh()
 
+    def up_note(self, msg: str) -> None:
+        """Set the dim 'Recent' line in the UPLOAD panel (last finished upload)."""
+        with self._lock:
+            self._up_note = msg
+        self._refresh()
+
     # ------------------------------------------------------------------ #
     # Rendering
     # ------------------------------------------------------------------ #
 
     def _render(self) -> Group:
         with self._lock:
-            # Panels first, recent-log tail last. The tail is capped to whatever
-            # vertical room is left after the panels so the whole renderable
-            # never exceeds the window height — an over-tall frame is what Rich
-            # can't redraw in place, and that stacking is the bug being fixed.
-            panels = [self._render_download(), self._render_upload()]
-            budget = self._console.size.height - self._PANEL_ROWS - 1
-            tail = self._render_log_tail(max(0, budget))
-            return Group(*panels, tail) if tail is not None else Group(*panels)
-
-    # Fixed rows the two panels occupy (borders + content), used to size the tail.
-    _PANEL_ROWS = 11
-
-    def _render_log_tail(self, max_lines: int) -> Table | None:
-        if max_lines <= 0 or not self._log_buf:
-            return None
-        rows = list(self._log_buf)[-max_lines:]
-        t = Table.grid(padding=(0, 1))
-        t.add_column(style="dim cyan", no_wrap=True)
-        t.add_column(overflow="ellipsis", no_wrap=True)
-        for msg, style in rows:
-            if len(msg) >= 8 and msg[2] == ":" and msg[5] == ":":
-                ts, rest = msg[:8], msg[8:].lstrip()
-            else:
-                ts, rest = "", msg
-            t.add_row(Text(ts), Text(rest, style=style))
-        return t
+            # Two fixed-height panels, plus one optional alert line. Nothing here
+            # grows with the run, so the whole frame stays short enough for Rich
+            # to redraw in place — the over-tall renderable is what stacked.
+            parts = [self._render_download(), self._render_upload()]
+            if self._alert[0]:
+                parts.append(Text(self._alert[0], style=self._alert[1],
+                                  overflow="ellipsis", no_wrap=True))
+            return Group(*parts)
 
     def _render_download(self) -> Panel:
         d = self._dl
@@ -324,6 +334,9 @@ class Dashboard:
                 f"All {self._total} videos downloaded — draining uploads…",
                 style="bold green"))
 
+        if d["note"]:
+            t.add_row("Recent", Text(d["note"], style="dim", overflow="ellipsis"))
+
         return Panel(t, title="[bold cyan]DOWNLOAD[/]",
                      border_style="cyan", padding=(0, 1))
 
@@ -350,6 +363,9 @@ class Dashboard:
             t.add_row("Queue", Text(f"({len(q)})  {shown}", style="yellow"))
         else:
             t.add_row("Queue", Text("empty", style="dim"))
+
+        if self._up_note:
+            t.add_row("Recent", Text(self._up_note, style="dim", overflow="ellipsis"))
 
         return Panel(t, title="[bold magenta]UPLOAD[/]",
                      border_style="magenta", padding=(0, 1))

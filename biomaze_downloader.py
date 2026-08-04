@@ -83,9 +83,11 @@ for noisy in ("httpx", "urllib3", "huggingface_hub", "filelock"):
 
 def _attach_dashboard_logging(dashboard) -> None:
     """
-    Replace the stdout StreamHandler with the dashboard's log handler so every
-    log line flows into the scrolling region of the live UI instead of racing
-    with Rich's own terminal writes.  The file handler is kept.
+    Replace the stdout StreamHandler with the dashboard's handler so log lines
+    stop racing with Rich's own terminal writes. The dashboard shows only
+    WARNING+ (as a sticky alert line); routine INFO results are folded into the
+    panels via dl_note()/up_note(). The file handler is kept, so downloader.log
+    still gets the full, unabridged history.
     """
     root = logging.getLogger()
     for h in list(root.handlers):
@@ -797,6 +799,9 @@ def download_video(m3u8_content: str, output_path: str, label: str = "video",
             return False
 
         log.info(f"  [{label}] 100% — {size_mb:.0f} MB in {time.time() - t0:.0f}s")
+        if _d and _d.is_active():
+            _d.dl_note(f"✓ {filename or os.path.basename(output_path)} "
+                       f"[{label}] {size_mb:.0f} MB in {time.time() - t0:.0f}s")
         return True
     else:
         stderr = result.stderr[-300:] if result.stderr else "no stderr"
@@ -895,6 +900,10 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
                 return False
             log.info(f"  Uploaded in {elapsed:.0f}s "
                      f"({remote_info[0].size / 1048576:.0f} MB verified)")
+            _d = dash.get() if _HAS_DASH else None
+            if _d and _d.is_active():
+                _d.up_note(f"✓ {filename} [{quality}p] "
+                           f"{remote_info[0].size / 1048576:.0f} MB in {elapsed:.0f}s")
             return True
         except Exception as e:
             log.error(f"  Upload verification failed for {remote}: "
@@ -1054,6 +1063,8 @@ def process_json(json_path: str, output_base: str = "./data"):
             with results_lock:
                 results["skipped"] += 1
             log.info(f"[{done}/{total_links}] ✓ {filename} — already on HF")
+            if board and board.is_active():
+                board.dl_note(f"✓ {filename} — already on HF")
             continue
 
         with vs_lock:
