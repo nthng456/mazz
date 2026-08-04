@@ -7,11 +7,13 @@ The live region holds exactly two fixed-height boxes:
 
 plus a single sticky line beneath them for the most recent warning/error.
 
-There is deliberately NO scrolling log region. A live renderable that grows
-taller than the window can't be redrawn in place — Rich stacks frames instead
-of updating, which is what left a trail of duplicated boxes in the output.
-Keeping the region to two short boxes of constant height (and cropping any
-overflow) means the frame always redraws in place.
+There is deliberately NO scrolling log region. The live region is rendered into
+the terminal's ALTERNATE screen buffer (Live(screen=True)) — a fixed viewport
+with no scrollback, like htop/less — so the panels always redraw in place and
+can never leave a trail of stacked copies behind. That trail was the pty/VS Code
+failure mode: the region sat near the bottom of the screen, and when its height
+changed (extracting → downloading) the screen scrolled and desynced Rich's
+in-place redraw. The alternate screen never scrolls, so it can't happen.
 
 The relevant per-item results that used to scroll past are folded INTO the
 boxes instead: each panel carries a dim "Recent" line set via dl_note()/
@@ -180,12 +182,21 @@ class Dashboard:
 
     def start(self) -> "Dashboard":
         if self._can_render():
+            # screen=True renders into the terminal's ALTERNATE screen buffer
+            # (like htop/less): a fixed viewport with no scrollback at all, so
+            # the panels redraw in place and can never leave stacked copies
+            # behind. This is the real fix for the trail of duplicated boxes —
+            # on a pty/VS Code terminal the live region sat near the bottom, and
+            # when its height changed (extracting → downloading) the screen
+            # scrolled, desyncing Rich's redraw. The alternate screen never
+            # scrolls, so that can't happen. Full history stays in downloader.log,
+            # and any final summary prints normally once the screen is restored.
             self._live = Live(
                 self._render(),
                 console=self._console,
                 refresh_per_second=self._REFRESH_HZ,
                 transient=False,
-                vertical_overflow="crop",
+                screen=True,
             )
             self._live.start()
         return self

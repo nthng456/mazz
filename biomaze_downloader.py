@@ -1136,11 +1136,20 @@ def process_json(json_path: str, output_base: str = "./data"):
     for t in upload_threads:
         t.join()
 
-    log.info(f"=== DONE — ok {results['success']}, failed {results['failed']}, "
-             f"skipped {results['skipped']} in {(time.time() - t0) / 60:.0f} min ===")
+    summary = (f"=== DONE — ok {results['success']}, failed {results['failed']}, "
+               f"skipped {results['skipped']} in {(time.time() - t0) / 60:.0f} min ===")
+    was_active = bool(board and board.is_active())
+    log.info(summary)
 
     if board:
         board.stop()
+
+    # The dashboard ran on the alternate screen, which stop() just tore down —
+    # so its suppressed-to-file summary never hit the screen. Echo it once to the
+    # restored screen. (When the dashboard was inactive the normal stdout handler
+    # already printed it, so don't print twice.)
+    if was_active:
+        print(summary)
 
 
 if __name__ == "__main__":
