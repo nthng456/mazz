@@ -34,6 +34,12 @@ except Exception:
     dash = None
     _HAS_DASH = False
 
+# ArvanCloud links (player.arvancloud.ir/...?config=...origin_config.json) are a
+# standard, openly-keyed AES-128 HLS and go through ffmpeg instead of the
+# Playwright key-capture path. The module imports only `dashboard`, so importing
+# it here creates no cycle.
+import arvan_downloader as arvan
+
 REFERER = "https://stream.biomaze.ir"
 QUALITIES = ["720"]
 HF_BUCKET = "hf://buckets/nthng454/Bucket"
@@ -1084,10 +1090,25 @@ def process_course(course: dict, output_base: str, source_label: str) -> None:
         log.info(f"[{done}/{total_links}] ▶ {filename} "
                  f"(need: {', '.join(todo)})")
 
+        # ArvanCloud links skip the Playwright/key-capture path: ffmpeg fetches,
+        # decrypts and remuxes the chosen rendition itself. Everything
+        # downstream — the upload queue, dashboard and per-video accounting — is
+        # shared, so only the extract+download step differs.
+        is_arvan = arvan.is_arvan_url(link)
+
         if board and board.is_active():
             board.dl_extracting(filename, done)
-        playlists = extract_m3u8_per_quality(link)
-        if not playlists:
+
+        playlists = None
+        resolved = None
+        if is_arvan:
+            resolved = arvan.resolve(link)
+            failed = resolved is None
+        else:
+            playlists = extract_m3u8_per_quality(link)
+            failed = not playlists
+
+        if failed:
             log.error(f"  extraction failed: {link}")
             with vs_lock:
                 video_states[filename]["ok"] = False
@@ -1096,21 +1117,28 @@ def process_course(course: dict, output_base: str, source_label: str) -> None:
             continue
 
         for q in todo:
-            if q not in playlists:
-                log.warning(f"  [{q}p] not offered by the master playlist")
-                with vs_lock:
-                    video_states[filename]["ok"] = False
-                continue
-
             out_path = os.path.join(folder_path, q, filename)
 
-            # Higher renditions first, then lower ones down to FALLBACK_FLOOR.
-            # Built from every rendition the manifest offers, not just those in
-            # QUALITIES, so narrowing QUALITIES does not remove the recovery path.
-            fallbacks = build_fallback_chain(q, playlists)
-            dl_ok = download_video(playlists[q], out_path, label=f"{q}p",
-                                   fallbacks=fallbacks, job_num=done,
-                                   filename=filename)
+            if is_arvan:
+                # download_quality picks the nearest rendition at or below q and
+                # logs if it had to substitute, so no pre-check is needed here.
+                dl_ok = arvan.download_quality(resolved, out_path, q,
+                                               job_num=done, filename=filename)
+            else:
+                if q not in playlists:
+                    log.warning(f"  [{q}p] not offered by the master playlist")
+                    with vs_lock:
+                        video_states[filename]["ok"] = False
+                    continue
+
+                # Higher renditions first, then lower ones down to FALLBACK_FLOOR.
+                # Built from every rendition the manifest offers, not just those
+                # in QUALITIES, so narrowing QUALITIES does not remove recovery.
+                fallbacks = build_fallback_chain(q, playlists)
+                dl_ok = download_video(playlists[q], out_path, label=f"{q}p",
+                                       fallbacks=fallbacks, job_num=done,
+                                       filename=filename)
+
             if not dl_ok:
                 log.error(f"  [{q}p] download failed")
                 with vs_lock:
