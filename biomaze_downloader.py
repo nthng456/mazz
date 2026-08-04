@@ -88,10 +88,16 @@ def _attach_dashboard_logging(dashboard) -> None:
     WARNING+ (as a sticky alert line); routine INFO results are folded into the
     panels via dl_note()/up_note(). The file handler is kept, so downloader.log
     still gets the full, unabridged history.
+
+    Any DashboardLogHandler left over from a previous course in a multi-course
+    run is dropped first, so alerts only ever reach the live board and handlers
+    don't accumulate one per course.
     """
     root = logging.getLogger()
     for h in list(root.handlers):
         if isinstance(h, logging.StreamHandler) and h.stream is sys.stdout:
+            root.removeHandler(h)
+        elif _HAS_DASH and isinstance(h, dash.DashboardLogHandler):
             root.removeHandler(h)
     dh = dash.DashboardLogHandler(dashboard)
     dh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
@@ -918,20 +924,22 @@ def upload_file_to_hf(local_path: str, folder_name: str, quality: str, filename:
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def process_json(json_path: str, output_base: str = "./data"):
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
+def process_course(course: dict, output_base: str, source_label: str) -> None:
+    """
+    Download + upload every video in one course object, whose shape is the
+    reference layout: {subject?, folder_name, files}. `source_label` names the
+    source in the run header (e.g. "physics.json" or "physics.json [2/5]").
+    """
     # An optional "subject" nests the course under a top-level folder, e.g.
     # subject "فیزیک" + folder_name "شجاعی - سالیانه جامع 405" →
     # "فیزیک/شجاعی - سالیانه جامع 405". It is folded into folder_name here so
     # every downstream path (local dirs, HF bucket, inventory) stays two-level
-    # without further changes. JSONs without a subject keep the flat layout.
-    folder_name = data["folder_name"]
-    subject = data.get("subject", "").strip()
+    # without further changes. Courses without a subject keep the flat layout.
+    folder_name = course["folder_name"]
+    subject = course.get("subject", "").strip()
     if subject:
         folder_name = f"{subject}/{folder_name}"
-    files = data["files"]
+    files = course["files"]
 
     folder_path = os.path.join(output_base, *folder_name.split("/"))
     for q in QUALITIES:
@@ -939,7 +947,7 @@ def process_json(json_path: str, output_base: str = "./data"):
 
     total_links = sum(len(f["links"]) for f in files)
     t0 = time.time()
-    log.info(f"=== {os.path.basename(json_path)} — {len(files)} sessions, "
+    log.info(f"=== {source_label} — {len(files)} sessions, "
              f"{total_links} videos → {folder_name} ===")
 
     # Flatten to (filename, url) first so the bucket can be queried in one call.
@@ -1150,6 +1158,42 @@ def process_json(json_path: str, output_base: str = "./data"):
     # already printed it, so don't print twice.)
     if was_active:
         print(summary)
+
+
+def process_json(json_path: str, output_base: str = "./data") -> None:
+    """
+    Load a course library and download it.
+
+    The file may be either a single course object ({subject?, folder_name,
+    files}) or a JSON array of such objects — a combined library holding
+    several courses in one file. Each course is processed in turn, so an array
+    file behaves exactly like running the downloader once per course, and a
+    single-object file keeps working unchanged.
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    base = os.path.basename(json_path)
+    if isinstance(data, dict):
+        courses = [data]
+    elif isinstance(data, list):
+        courses = data
+    else:
+        raise ValueError(f"{base}: top level must be a JSON object or array, "
+                         f"got {type(data).__name__}")
+
+    if not courses:
+        log.warning(f"{base}: no courses to process")
+        return
+
+    for idx, course in enumerate(courses, start=1):
+        if (not isinstance(course, dict)
+                or "folder_name" not in course or "files" not in course):
+            raise ValueError(
+                f"{base}: course #{idx} must be an object with "
+                f"'folder_name' and 'files' keys")
+        label = base if len(courses) == 1 else f"{base} [{idx}/{len(courses)}]"
+        process_course(course, output_base, label)
 
 
 if __name__ == "__main__":
