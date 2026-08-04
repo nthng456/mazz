@@ -69,52 +69,86 @@ echo " Setup complete!"
 echo "========================================"
 echo ""
 
-# --- Run the downloader ---
-# Prompt for a local JSON path and an output dir, then launch the downloader.
-# Skipped automatically when there is no interactive terminal (e.g. piped setup)
-# so the script stays usable in non-interactive/CI contexts.
-if [ ! -t 0 ]; then
-    echo "Non-interactive shell — skipping run."
-    echo "Run it yourself with:"
-    echo "  python biomaze_downloader.py <json_path> ./data"
-    exit 0
+# --- Run the downloader (detached / background) ---
+# The downloader is launched with `setsid nohup ... &` so it keeps running
+# after the terminal/SSH session is closed (e.g. when you disconnect from the
+# Codespace). Output is redirected to a log file; the PID is saved so you can
+# check on or stop the run later.
+#
+# NOTE: this only survives a *disconnect*. GitHub Codespaces still stops the
+# whole container after its idle timeout — raise it under
+# Settings → Codespaces → "Default idle timeout" (or keep the Codespace open).
+
+LOG_FILE="download.log"
+PID_FILE="download.pid"
+
+# Inputs may come from the environment (works in non-interactive/CI shells):
+#   JSON_PATH=data.json OUTPUT_DIR=./data ./setup.sh
+json_path="${JSON_PATH:-}"
+output_dir="${OUTPUT_DIR:-}"
+
+if [ -z "$json_path" ] || [ -z "$output_dir" ]; then
+    if [ ! -t 0 ]; then
+        echo "Non-interactive shell and JSON_PATH/OUTPUT_DIR not set — skipping run."
+        echo "Run it yourself in the background with:"
+        echo "  JSON_PATH=<json> OUTPUT_DIR=./data ./setup.sh"
+        echo "or:"
+        echo "  setsid nohup python biomaze_downloader.py <json_path> ./data > $LOG_FILE 2>&1 &"
+        exit 0
+    fi
+
+    # Suggest a JSON from the current directory as the default (first match).
+    default_json=""
+    for f in *.json; do
+        [ -e "$f" ] && default_json="$f" && break
+    done
+
+    while :; do
+        if [ -n "$default_json" ]; then
+            read -r -p "Path to the JSON file [${default_json}]: " json_path || exit 0
+            json_path="${json_path:-$default_json}"
+        else
+            read -r -p "Path to the JSON file: " json_path || exit 0
+        fi
+
+        if [ -z "$json_path" ]; then
+            echo "  Please enter a path."
+            continue
+        fi
+        if [ ! -f "$json_path" ]; then
+            echo "  ✗ File not found: $json_path — try again."
+            continue
+        fi
+        break
+    done
+
+    read -r -p "Output directory [./data]: " output_dir || exit 0
+    output_dir="${output_dir:-./data}"
 fi
 
-# Suggest a JSON from the current directory as the default (first match).
-default_json=""
-for f in *.json; do
-    [ -e "$f" ] && default_json="$f" && break
-done
-
-json_path=""
-while :; do
-    if [ -n "$default_json" ]; then
-        read -r -p "Path to the JSON file [${default_json}]: " json_path || exit 0
-        json_path="${json_path:-$default_json}"
-    else
-        read -r -p "Path to the JSON file: " json_path || exit 0
-    fi
-
-    if [ -z "$json_path" ]; then
-        echo "  Please enter a path."
-        continue
-    fi
-    if [ ! -f "$json_path" ]; then
-        echo "  ✗ File not found: $json_path — try again."
-        continue
-    fi
-    break
-done
-
-read -r -p "Output directory [./data]: " output_dir || exit 0
-output_dir="${output_dir:-./data}"
+if [ ! -f "$json_path" ]; then
+    echo "  ✗ File not found: $json_path"
+    exit 1
+fi
 
 echo ""
 echo "========================================"
-echo " Running downloader"
+echo " Launching downloader in the background"
 echo "   JSON:   $json_path"
 echo "   Output: $output_dir"
+echo "   Log:    $LOG_FILE"
 echo "========================================"
 echo ""
 
-python biomaze_downloader.py "$json_path" "$output_dir"
+# setsid detaches from the controlling terminal; nohup ignores SIGHUP so the
+# process is not killed when the terminal/SSH session closes.
+setsid nohup python biomaze_downloader.py "$json_path" "$output_dir" \
+    > "$LOG_FILE" 2>&1 &
+child_pid=$!
+echo "$child_pid" > "$PID_FILE"
+
+echo "  ✓ Started (PID $child_pid). It will keep running after you disconnect."
+echo ""
+echo "  Follow progress:   tail -f $LOG_FILE"
+echo "  Check if running:  kill -0 $child_pid 2>/dev/null && echo running || echo stopped"
+echo "  Stop it:           kill \$(cat $PID_FILE)"

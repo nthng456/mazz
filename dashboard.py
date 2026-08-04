@@ -122,8 +122,9 @@ def _pulse(elapsed: float, width: int = 24, block: int = 6,
 
 class Dashboard:
     """
-    Thread-safe live dashboard.  All public set_/push_ methods may be called
-    from any thread; each takes _lock briefly and asks Live to re-render.
+    Thread-safe live dashboard.  All public setter methods (dl_*, up_*,
+    set_queue, set_alert) may be called from any thread; each takes _lock
+    briefly and asks Live to re-render.
     """
 
     _REFRESH_HZ = 8      # Rich Live refresh rate (renders per second)
