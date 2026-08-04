@@ -66,5 +66,55 @@ fi
 echo ""
 echo "========================================"
 echo " Setup complete!"
-echo " Run:  python biomaze_downloader.py input.json ./data"
 echo "========================================"
+echo ""
+
+# --- Run the downloader ---
+# Prompt for a local JSON path and an output dir, then launch the downloader.
+# Skipped automatically when there is no interactive terminal (e.g. piped setup)
+# so the script stays usable in non-interactive/CI contexts.
+if [ ! -t 0 ]; then
+    echo "Non-interactive shell — skipping run."
+    echo "Run it yourself with:"
+    echo "  python biomaze_downloader.py <json_path> ./data"
+    exit 0
+fi
+
+# Suggest a JSON from the current directory as the default (first match).
+default_json=""
+for f in *.json; do
+    [ -e "$f" ] && default_json="$f" && break
+done
+
+json_path=""
+while :; do
+    if [ -n "$default_json" ]; then
+        read -r -p "Path to the JSON file [${default_json}]: " json_path || exit 0
+        json_path="${json_path:-$default_json}"
+    else
+        read -r -p "Path to the JSON file: " json_path || exit 0
+    fi
+
+    if [ -z "$json_path" ]; then
+        echo "  Please enter a path."
+        continue
+    fi
+    if [ ! -f "$json_path" ]; then
+        echo "  ✗ File not found: $json_path — try again."
+        continue
+    fi
+    break
+done
+
+read -r -p "Output directory [./data]: " output_dir || exit 0
+output_dir="${output_dir:-./data}"
+
+echo ""
+echo "========================================"
+echo " Running downloader"
+echo "   JSON:   $json_path"
+echo "   Output: $output_dir"
+echo "========================================"
+echo ""
+
+python biomaze_downloader.py "$json_path" "$output_dir"
