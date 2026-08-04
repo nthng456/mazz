@@ -13,8 +13,8 @@ echo "========================================"
 # --- System packages ---
 echo "[1/4] Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq ffmpeg curl > /dev/null 2>&1
-echo "  ✓ ffmpeg installed"
+sudo apt-get install -y -qq ffmpeg curl tmux > /dev/null 2>&1
+echo "  ✓ ffmpeg, tmux installed"
 
 # --- Python deps ---
 # huggingface_hub must be >=1.0: bucket support (sync_bucket,
@@ -69,18 +69,17 @@ echo " Setup complete!"
 echo "========================================"
 echo ""
 
-# --- Run the downloader (detached / background) ---
-# The downloader is launched with `setsid nohup ... &` so it keeps running
-# after the terminal/SSH session is closed (e.g. when you disconnect from the
-# Codespace). Output is redirected to a log file; the PID is saved so you can
-# check on or stop the run later.
+# --- Run the downloader (detached inside tmux) ---
+# The downloader runs inside a tmux session so it keeps running after the
+# terminal/SSH session is closed (e.g. when you disconnect from the Codespace).
+# Unlike a plain nohup+logfile, tmux gives the process a real terminal, so you
+# can re-attach any time and watch the LIVE output (rich progress bars, etc.).
 #
 # NOTE: this only survives a *disconnect*. GitHub Codespaces still stops the
 # whole container after its idle timeout — raise it under
 # Settings → Codespaces → "Default idle timeout" (or keep the Codespace open).
 
-LOG_FILE="download.log"
-PID_FILE="download.pid"
+SESSION="biomaze"
 
 # Inputs may come from the environment (works in non-interactive/CI shells):
 #   JSON_PATH=data.json OUTPUT_DIR=./data ./setup.sh
@@ -90,10 +89,10 @@ output_dir="${OUTPUT_DIR:-}"
 if [ -z "$json_path" ] || [ -z "$output_dir" ]; then
     if [ ! -t 0 ]; then
         echo "Non-interactive shell and JSON_PATH/OUTPUT_DIR not set — skipping run."
-        echo "Run it yourself in the background with:"
+        echo "Run it yourself in a tmux session with:"
         echo "  JSON_PATH=<json> OUTPUT_DIR=./data ./setup.sh"
         echo "or:"
-        echo "  setsid nohup python biomaze_downloader.py <json_path> ./data > $LOG_FILE 2>&1 &"
+        echo "  tmux new -s $SESSION 'python biomaze_downloader.py <json_path> ./data'"
         exit 0
     fi
 
@@ -131,24 +130,33 @@ if [ ! -f "$json_path" ]; then
     exit 1
 fi
 
+# Refuse to clobber an already-running session.
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "  ⚠  A tmux session named '$SESSION' is already running."
+    echo "     Attach to it:  tmux attach -t $SESSION"
+    echo "     Or kill it:    tmux kill-session -t $SESSION"
+    exit 1
+fi
+
 echo ""
 echo "========================================"
-echo " Launching downloader in the background"
+echo " Launching downloader in tmux ('$SESSION')"
 echo "   JSON:   $json_path"
 echo "   Output: $output_dir"
-echo "   Log:    $LOG_FILE"
 echo "========================================"
 echo ""
 
-# setsid detaches from the controlling terminal; nohup ignores SIGHUP so the
-# process is not killed when the terminal/SSH session closes.
-setsid nohup python biomaze_downloader.py "$json_path" "$output_dir" \
-    > "$LOG_FILE" 2>&1 &
-child_pid=$!
-echo "$child_pid" > "$PID_FILE"
+# Start the downloader detached inside tmux. `exec` keeps the session name bound
+# to the python process; when it exits the session ends on its own.
+# `remain-on-exit on` keeps the pane visible after it finishes so you can read
+# the final output/errors instead of the session vanishing.
+tmux new-session -d -s "$SESSION" \
+    "exec python biomaze_downloader.py \"$json_path\" \"$output_dir\""
+tmux set-option -t "$SESSION" remain-on-exit on
 
-echo "  ✓ Started (PID $child_pid). It will keep running after you disconnect."
+echo "  ✓ Started in tmux. It will keep running after you disconnect."
 echo ""
-echo "  Follow progress:   tail -f $LOG_FILE"
-echo "  Check if running:  kill -0 $child_pid 2>/dev/null && echo running || echo stopped"
-echo "  Stop it:           kill \$(cat $PID_FILE)"
+echo "  Watch it LIVE:     tmux attach -t $SESSION"
+echo "     (detach without stopping:  press Ctrl+B then D)"
+echo "  Check if running:  tmux has-session -t $SESSION 2>/dev/null && echo running || echo stopped"
+echo "  Stop it:           tmux kill-session -t $SESSION"
